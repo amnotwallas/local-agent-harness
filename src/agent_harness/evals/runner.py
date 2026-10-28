@@ -29,7 +29,7 @@ class ScenarioModel:
                 for i, call in enumerate(self.scenario.expected_tool_calls)
             ]
             return ChatResult(tool_calls=calls)
-        answer = " ".join(self.scenario.required_facts)
+        answer = " ".join(phrases[0] for phrases in self.scenario.required_facts.values())
         return ChatResult(content=json.dumps({"final": answer}) if tools is None else answer)
 
 
@@ -41,8 +41,10 @@ def score_result(scenario: Scenario, result: AgentResult) -> dict[str, Any]:
     expected_calls = [call.model_dump() for call in scenario.expected_tool_calls]
     errors = sum(item.error is not None for item in result.tool_history)
     required_facts = {
-        fact: "covered" if fact.casefold() in answer.casefold() else "uncovered"
-        for fact in scenario.required_facts
+        fact: "covered"
+        if any(phrase.casefold() in answer.casefold() for phrase in equivalents)
+        else "uncovered"
+        for fact, equivalents in scenario.required_facts.items()
     }
     try:
         typed_result = AgentResult.model_validate(dict(result.__dict__))
@@ -50,21 +52,36 @@ def score_result(scenario: Scenario, result: AgentResult) -> dict[str, Any]:
         schema_ok = all(key in response_fields for key in scenario.expected_output_structure)
     except Exception:
         schema_ok = False
-    selection_ok = actual_calls == expected_calls
+    allowed_calls = [call.model_dump() for call in scenario.allowed_tool_calls]
+    forbidden_calls = [call.model_dump() for call in scenario.forbidden_tool_calls]
+    ordered_index = 0
+    required_in_order = True
+    for actual in actual_calls:
+        if ordered_index < len(expected_calls) and actual == expected_calls[ordered_index]:
+            ordered_index += 1
+        elif actual in expected_calls and actual not in allowed_calls:
+            required_in_order = False
+    selection_ok = (
+        required_in_order
+        and ordered_index == len(expected_calls)
+        and all(actual in expected_calls or actual in allowed_calls for actual in actual_calls)
+        and not any(actual in forbidden_calls for actual in actual_calls)
+    )
     arguments_valid = all(item.arguments_valid is True for item in result.tool_history)
-    task_success = (
-        result.status == "completed"
-        and selection_ok
-        and arguments_valid
+    evaluation_ok = (
+        arguments_valid
         and all(value == "covered" for value in required_facts.values())
         and schema_ok
         and errors == scenario.expected_tool_errors
     )
+    task_success = result.status == "completed" and selection_ok and evaluation_ok
     return {
         "status": result.status,
         "tool_calls": actual_calls,
         "expected_tool_calls": expected_calls,
         "tool_selection_accuracy": selection_ok,
+        "evaluation_assertions_passed": evaluation_ok,
+        "infrastructure_error": result.status in {"failed", "deadline_exceeded"},
         "tool_argument_validity": [
             "valid" if item.arguments_valid else "invalid" for item in result.tool_history
         ],
@@ -119,6 +136,7 @@ async def evaluate(
         "metadata": {
             "mode": mode,
             "evaluation_scope": "harness_behavior" if mode == "mock" else "live_model_behavior",
+            "tool_data_scope": "scenario_fixtures",
             "model": resolved_model_id,
             "dataset": "aiops-v1",
             "harness_version": "0.1.0",
@@ -137,8 +155,21 @@ async def evaluate(
             "completed": sum(row["status"] == "completed" for row in results),
             "task_successes": sum(row["task_success"] for row in results),
             "tool_selection_passed": sum(row["tool_selection_accuracy"] for row in results),
+            "tool_selection_failures": sum(not row["tool_selection_accuracy"] for row in results),
+            "evaluation_failures": sum(not row["evaluation_assertions_passed"] for row in results),
+            "infrastructure_errors": sum(row["infrastructure_error"] for row in results),
+            "by_scenario": {},
         },
     }
+    for scenario in scenarios:
+        rows = [row for row in results if row["test_id"] == scenario.test_id]
+        report["summary"]["by_scenario"][scenario.test_id] = {
+            "trials": len(rows),
+            "task_successes": sum(row["task_success"] for row in rows),
+            "tool_selection_passed": sum(row["tool_selection_accuracy"] for row in rows),
+            "evaluation_failures": sum(not row["evaluation_assertions_passed"] for row in rows),
+            "infrastructure_errors": sum(row["infrastructure_error"] for row in rows),
+        }
     if baseline:
         previous = json.loads(baseline.read_text())
         report["baseline_comparison"] = {

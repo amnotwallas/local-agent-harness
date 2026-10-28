@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ExpectedCall(BaseModel):
@@ -17,11 +17,13 @@ class Scenario(BaseModel):
     category: str
     task: str
     expected_tool_calls: list[ExpectedCall]
-    required_facts: list[str]
+    allowed_tool_calls: list[ExpectedCall] = Field(default_factory=list)
+    forbidden_tool_calls: list[ExpectedCall] = Field(default_factory=list)
+    required_facts: dict[str, list[str]]
     unsupported_claims: list[str]
     expected_output_structure: list[str]
     max_tool_iterations: int
-    mock_tool_responses: dict[str, Any]
+    mock_tool_responses: dict[str, list[dict[str, Any]]]
     expected_tool_errors: int = 0
 
 

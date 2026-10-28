@@ -1,5 +1,5 @@
 from collections.abc import Awaitable, Callable
-from typing import Any, get_origin
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
@@ -100,15 +100,29 @@ INCIDENTS = {
         "evidence": ["deployment preceded symptoms", "connection pool warnings"],
     }
 }
+TOOL_DESCRIPTIONS = {
+    "get_service_health": (
+        "Check current status, latency, error rate, CPU, and memory for a named service."
+    ),
+    "get_recent_logs": (
+        "Inspect recent log entries for a service; use to investigate errors, timeouts, "
+        "warnings, or other symptoms. Filter by service and severity when useful."
+    ),
+    "get_incident_details": (
+        "Retrieve the timeline, symptoms, related services, and recorded evidence for a known "
+        "incident ID."
+    ),
+}
 
 
 class ToolRegistry:
     def __init__(
-        self, allowed: set[str] | None = None, mock_responses: dict[str, Any] | None = None
+        self,
+        allowed: set[str] | None = None,
+        mock_responses: dict[str, list[dict[str, Any]]] | None = None,
     ) -> None:
         self._allowed = allowed
         self._mock_responses = mock_responses or {}
-        self._mock_indices: dict[str, int] = {}
         self._tools: dict[str, tuple[type[BaseModel], Any, Callable[[Any], Awaitable[Any]]]] = {}
         self.register("get_service_health", ServiceHealthInput, ServiceHealth, self._health)
         self.register("get_recent_logs", LogsInput, list[LogEntry], self._logs)
@@ -136,7 +150,7 @@ class ToolRegistry:
                 "type": "function",
                 "function": {
                     "name": name,
-                    "description": name.replace("_", " "),
+                    "description": TOOL_DESCRIPTIONS[name],
                     "parameters": self._tools[name][0].model_json_schema(),
                 },
             }
@@ -146,14 +160,22 @@ class ToolRegistry:
     async def call(self, name: str, arguments: dict[str, Any]) -> Any:
         parsed = self.validate(name, arguments)
         _, output_model, fn = self._tools[name]
-        result = await fn(parsed)
         if name in self._mock_responses:
-            index = self._mock_indices.get(name, 0)
-            fixture = self._mock_responses[name]
-            if isinstance(fixture, list) and get_origin(output_model) is not list:
-                fixture = fixture[min(index, len(fixture) - 1)]
-            self._mock_indices[name] = index + 1
-            result = fixture
+            parsed_arguments = parsed.model_dump(mode="json")
+            fixture = next(
+                (
+                    item["response"]
+                    for item in self._mock_responses[name]
+                    if self._tools[name][0]
+                    .model_validate(item["arguments"])
+                    .model_dump(mode="json")
+                    == parsed_arguments
+                ),
+                None,
+            )
+            if fixture is not None:
+                return TypeAdapter(output_model).validate_python(fixture)
+        result = await fn(parsed)
         return TypeAdapter(output_model).validate_python(result)
 
     def validate(self, name: str, arguments: dict[str, Any]) -> BaseModel:
@@ -189,6 +211,7 @@ class ToolRegistry:
 
 
 def build_registry(
-    allowed: set[str] | None = None, mock_responses: dict[str, Any] | None = None
+    allowed: set[str] | None = None,
+    mock_responses: dict[str, list[dict[str, Any]]] | None = None,
 ) -> ToolRegistry:
     return ToolRegistry(allowed, mock_responses)

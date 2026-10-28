@@ -1,0 +1,539 @@
+[
+  {
+    "test_id": "healthy-service",
+    "category": "healthy",
+    "task": "Assess orders-api health",
+    "expected_tool_calls": [
+      {
+        "name": "get_service_health",
+        "arguments": {
+          "service_name": "orders-api"
+        }
+      }
+    ],
+    "required_facts": [
+      "orders-api",
+      "healthy"
+    ],
+    "unsupported_claims": [
+      "database caused the issue"
+    ],
+    "expected_output_structure": [
+      "request_id",
+      "execution_id",
+      "status",
+      "final_answer",
+      "tool_history",
+      "model_calls",
+      "model_duration_ms",
+      "termination_reason"
+    ],
+    "max_tool_iterations": 5,
+    "mock_tool_responses": {
+      "get_service_health": {
+        "service_name": "orders-api",
+        "status": "healthy",
+        "latency_ms": {
+          "p50": 35,
+          "p95": 110,
+          "p99": 190
+        },
+        "error_rate": 0.001,
+        "resource_utilization": {
+          "cpu": 0.32,
+          "memory": 0.57
+        }
+      }
+    },
+    "expected_tool_errors": 0
+  },
+  {
+    "test_id": "payment-latency-spike",
+    "category": "latency",
+    "task": "Investigate payments-api latency",
+    "expected_tool_calls": [
+      {
+        "name": "get_service_health",
+        "arguments": {
+          "service_name": "payments-api"
+        }
+      },
+      {
+        "name": "get_recent_logs",
+        "arguments": {
+          "service_name": "payments-api",
+          "severity": "ERROR",
+          "limit": 20
+        }
+      }
+    ],
+    "required_facts": [
+      "payments-api",
+      "p95",
+      "timeout"
+    ],
+    "unsupported_claims": [
+      "root cause is confirmed"
+    ],
+    "expected_output_structure": [
+      "request_id",
+      "execution_id",
+      "status",
+      "final_answer",
+      "tool_history",
+      "model_calls",
+      "model_duration_ms",
+      "termination_reason"
+    ],
+    "max_tool_iterations": 5,
+    "mock_tool_responses": {
+      "get_service_health": {
+        "service_name": "payments-api",
+        "status": "degraded",
+        "latency_ms": {
+          "p50": 82,
+          "p95": 940,
+          "p99": 1830
+        },
+        "error_rate": 0.087,
+        "resource_utilization": {
+          "cpu": 0.74,
+          "memory": 0.68
+        }
+      },
+      "get_recent_logs": [
+        {
+          "timestamp": "2026-10-28T09:12:00Z",
+          "service_name": "payments-api",
+          "severity": "ERROR",
+          "message": "upstream request timed out after 2s"
+        }
+      ]
+    },
+    "expected_tool_errors": 0
+  },
+  {
+    "test_id": "elevated-http-errors",
+    "category": "errors",
+    "task": "Review elevated HTTP errors for payments-api",
+    "expected_tool_calls": [
+      {
+        "name": "get_service_health",
+        "arguments": {
+          "service_name": "payments-api"
+        }
+      }
+    ],
+    "required_facts": [
+      "error rate",
+      "payments-api"
+    ],
+    "unsupported_claims": [
+      "all requests are failing"
+    ],
+    "expected_output_structure": [
+      "request_id",
+      "execution_id",
+      "status",
+      "final_answer",
+      "tool_history",
+      "model_calls",
+      "model_duration_ms",
+      "termination_reason"
+    ],
+    "max_tool_iterations": 5,
+    "mock_tool_responses": {
+      "get_service_health": {
+        "service_name": "payments-api",
+        "status": "degraded",
+        "latency_ms": {
+          "p50": 82,
+          "p95": 940,
+          "p99": 1830
+        },
+        "error_rate": 0.087,
+        "resource_utilization": {
+          "cpu": 0.74,
+          "memory": 0.68
+        }
+      }
+    },
+    "expected_tool_errors": 0
+  },
+  {
+    "test_id": "database-exhaustion",
+    "category": "database",
+    "task": "Check database connection capacity",
+    "expected_tool_calls": [
+      {
+        "name": "get_service_health",
+        "arguments": {
+          "service_name": "database"
+        }
+      },
+      {
+        "name": "get_recent_logs",
+        "arguments": {
+          "service_name": "database",
+          "severity": "WARNING",
+          "limit": 20
+        }
+      }
+    ],
+    "required_facts": [
+      "database",
+      "connection pool"
+    ],
+    "unsupported_claims": [
+      "database is unavailable"
+    ],
+    "expected_output_structure": [
+      "request_id",
+      "execution_id",
+      "status",
+      "final_answer",
+      "tool_history",
+      "model_calls",
+      "model_duration_ms",
+      "termination_reason"
+    ],
+    "max_tool_iterations": 5,
+    "mock_tool_responses": {
+      "get_service_health": {
+        "service_name": "database",
+        "status": "degraded",
+        "latency_ms": {
+          "p50": 12,
+          "p95": 480,
+          "p99": 900
+        },
+        "error_rate": 0.021,
+        "resource_utilization": {
+          "cpu": 0.91,
+          "memory": 0.83
+        }
+      },
+      "get_recent_logs": [
+        {
+          "timestamp": "2026-10-28T09:11:30Z",
+          "service_name": "database",
+          "severity": "WARNING",
+          "message": "connection pool at capacity"
+        }
+      ]
+    },
+    "expected_tool_errors": 0
+  },
+  {
+    "test_id": "deployment-incident",
+    "category": "deployment",
+    "task": "Summarize incident INC-1042",
+    "expected_tool_calls": [
+      {
+        "name": "get_incident_details",
+        "arguments": {
+          "incident_id": "INC-1042"
+        }
+      }
+    ],
+    "required_facts": [
+      "INC-1042",
+      "deployment"
+    ],
+    "unsupported_claims": [
+      "deployment definitively caused the incident"
+    ],
+    "expected_output_structure": [
+      "request_id",
+      "execution_id",
+      "status",
+      "final_answer",
+      "tool_history",
+      "model_calls",
+      "model_duration_ms",
+      "termination_reason"
+    ],
+    "max_tool_iterations": 5,
+    "mock_tool_responses": {
+      "get_incident_details": {
+        "incident_id": "INC-1042",
+        "timeline": [
+          {
+            "timestamp": "2026-10-28T09:00:00Z",
+            "event": "deployment started"
+          },
+          {
+            "timestamp": "2026-10-28T09:08:00Z",
+            "event": "payment errors increased"
+          }
+        ],
+        "symptoms": [
+          "elevated payment latency",
+          "increased 5xx rate"
+        ],
+        "related_services": [
+          "payments-api",
+          "database"
+        ],
+        "evidence": [
+          "deployment preceded symptoms",
+          "connection pool warnings"
+        ]
+      }
+    },
+    "expected_tool_errors": 0
+  },
+  {
+    "test_id": "conflicting-telemetry",
+    "category": "conflicting",
+    "task": "Compare payments-api and database telemetry",
+    "expected_tool_calls": [
+      {
+        "name": "get_service_health",
+        "arguments": {
+          "service_name": "payments-api"
+        }
+      },
+      {
+        "name": "get_service_health",
+        "arguments": {
+          "service_name": "database"
+        }
+      }
+    ],
+    "required_facts": [
+      "payments-api",
+      "database",
+      "uncertain"
+    ],
+    "unsupported_claims": [
+      "single confirmed cause"
+    ],
+    "expected_output_structure": [
+      "request_id",
+      "execution_id",
+      "status",
+      "final_answer",
+      "tool_history",
+      "model_calls",
+      "model_duration_ms",
+      "termination_reason"
+    ],
+    "max_tool_iterations": 5,
+    "mock_tool_responses": {
+      "get_service_health": [
+        {
+          "service_name": "payments-api",
+          "status": "degraded",
+          "latency_ms": {
+            "p50": 82,
+            "p95": 940,
+            "p99": 1830
+          },
+          "error_rate": 0.087,
+          "resource_utilization": {
+            "cpu": 0.74,
+            "memory": 0.68
+          }
+        },
+        {
+          "service_name": "database",
+          "status": "degraded",
+          "latency_ms": {
+            "p50": 12,
+            "p95": 480,
+            "p99": 900
+          },
+          "error_rate": 0.021,
+          "resource_utilization": {
+            "cpu": 0.91,
+            "memory": 0.83
+          }
+        }
+      ]
+    },
+    "expected_tool_errors": 0
+  },
+  {
+    "test_id": "missing-evidence",
+    "category": "missing",
+    "task": "Find evidence about service catalog-api",
+    "expected_tool_calls": [
+      {
+        "name": "get_service_health",
+        "arguments": {
+          "service_name": "catalog-api"
+        }
+      }
+    ],
+    "required_facts": [
+      "catalog-api",
+      "unknown"
+    ],
+    "unsupported_claims": [
+      "catalog-api is healthy"
+    ],
+    "expected_output_structure": [
+      "request_id",
+      "execution_id",
+      "status",
+      "final_answer",
+      "tool_history",
+      "model_calls",
+      "model_duration_ms",
+      "termination_reason"
+    ],
+    "max_tool_iterations": 5,
+    "mock_tool_responses": {},
+    "expected_tool_errors": 1
+  },
+  {
+    "test_id": "incomplete-logs",
+    "category": "incomplete",
+    "task": "Check recent logs for orders-api errors",
+    "expected_tool_calls": [
+      {
+        "name": "get_recent_logs",
+        "arguments": {
+          "service_name": "orders-api",
+          "severity": "ERROR",
+          "limit": 20
+        }
+      }
+    ],
+    "required_facts": [
+      "no matching logs",
+      "not proof"
+    ],
+    "unsupported_claims": [
+      "no errors occurred"
+    ],
+    "expected_output_structure": [
+      "request_id",
+      "execution_id",
+      "status",
+      "final_answer",
+      "tool_history",
+      "model_calls",
+      "model_duration_ms",
+      "termination_reason"
+    ],
+    "max_tool_iterations": 5,
+    "mock_tool_responses": {
+      "get_recent_logs": []
+    },
+    "expected_tool_errors": 0
+  },
+  {
+    "test_id": "tool-failure",
+    "category": "tool_failure",
+    "task": "Check unknown service unknown-api",
+    "expected_tool_calls": [
+      {
+        "name": "get_service_health",
+        "arguments": {
+          "service_name": "unknown-api"
+        }
+      }
+    ],
+    "required_facts": [
+      "tool failed",
+      "unable to verify"
+    ],
+    "unsupported_claims": [
+      "unknown-api is healthy"
+    ],
+    "expected_output_structure": [
+      "request_id",
+      "execution_id",
+      "status",
+      "final_answer",
+      "tool_history",
+      "model_calls",
+      "model_duration_ms",
+      "termination_reason"
+    ],
+    "max_tool_iterations": 5,
+    "mock_tool_responses": {},
+    "expected_tool_errors": 1
+  },
+  {
+    "test_id": "ambiguous-cause",
+    "category": "ambiguous",
+    "task": "Assess whether database caused payments-api incident INC-1042",
+    "expected_tool_calls": [
+      {
+        "name": "get_incident_details",
+        "arguments": {
+          "incident_id": "INC-1042"
+        }
+      },
+      {
+        "name": "get_service_health",
+        "arguments": {
+          "service_name": "database"
+        }
+      }
+    ],
+    "required_facts": [
+      "evidence",
+      "cannot confirm"
+    ],
+    "unsupported_claims": [
+      "database caused the incident"
+    ],
+    "expected_output_structure": [
+      "request_id",
+      "execution_id",
+      "status",
+      "final_answer",
+      "tool_history",
+      "model_calls",
+      "model_duration_ms",
+      "termination_reason"
+    ],
+    "max_tool_iterations": 5,
+    "mock_tool_responses": {
+      "get_incident_details": {
+        "incident_id": "INC-1042",
+        "timeline": [
+          {
+            "timestamp": "2026-10-28T09:00:00Z",
+            "event": "deployment started"
+          },
+          {
+            "timestamp": "2026-10-28T09:08:00Z",
+            "event": "payment errors increased"
+          }
+        ],
+        "symptoms": [
+          "elevated payment latency",
+          "increased 5xx rate"
+        ],
+        "related_services": [
+          "payments-api",
+          "database"
+        ],
+        "evidence": [
+          "deployment preceded symptoms",
+          "connection pool warnings"
+        ]
+      },
+      "get_service_health": {
+        "service_name": "database",
+        "status": "degraded",
+        "latency_ms": {
+          "p50": 12,
+          "p95": 480,
+          "p99": 900
+        },
+        "error_rate": 0.021,
+        "resource_utilization": {
+          "cpu": 0.91,
+          "memory": 0.83
+        }
+      }
+    },
+    "expected_tool_errors": 0
+  }
+]

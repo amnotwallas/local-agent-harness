@@ -6,7 +6,8 @@ from pathlib import Path
 from statistics import mean, median
 from typing import Any
 
-from agent_harness.agents.runtime import AgentResult, AgentRuntime, ExecutionStrategy
+from agent_harness.agents.incident_report import EvidenceStatement, IncidentReport
+from agent_harness.agents.runtime import AgentResult, AgentRuntime, ExecutionStrategy, OutputMode
 from agent_harness.config import Settings
 from agent_harness.evals.scenarios import Scenario, load_scenarios
 from agent_harness.models.client import ChatResult, OpenAIClient, ToolCall
@@ -14,13 +15,19 @@ from agent_harness.tools.registry import build_registry
 
 
 class ScenarioModel:
-    def __init__(self, scenario: Scenario, strategy: ExecutionStrategy) -> None:
+    def __init__(
+        self, scenario: Scenario, strategy: ExecutionStrategy, output_mode: OutputMode
+    ) -> None:
         self.scenario = scenario
         self.strategy = strategy
+        self.output_mode = output_mode
         self.sent_tools = False
 
     async def chat(
-        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> ChatResult:
         if (
             self.strategy in {"autonomous", "guided"}
@@ -36,6 +43,19 @@ class ScenarioModel:
             ]
             return ChatResult(tool_calls=calls)
         answer = " ".join(phrases[0] for phrases in self.scenario.required_facts.values())
+        if self.output_mode != "free_text" and tools is None:
+            sources = list(dict.fromkeys(call.name for call in self.scenario.expected_tool_calls))
+            return ChatResult(
+                content=IncidentReport(
+                    confirmed_observations=[
+                        EvidenceStatement(statement=phrase[0], evidence_sources=sources)
+                        for phrase in self.scenario.required_facts.values()
+                    ],
+                    hypotheses=[],
+                    missing_evidence=[],
+                    tool_failures=[],
+                ).model_dump_json()
+            )
         return ChatResult(content=json.dumps({"final": answer}) if tools is None else answer)
 
 
@@ -98,6 +118,22 @@ def score_result(scenario: Scenario, result: AgentResult) -> dict[str, Any]:
         and errors == scenario.expected_tool_errors
     )
     task_success = result.status == "completed" and selection_ok and evaluation_ok
+    report = result.incident_report
+    available_sources = {
+        item.tool_name
+        for item in result.tool_history
+        if item.error is None and item.result is not None
+    }
+    report_observations = report.confirmed_observations if report is not None else []
+    attribution_matches = sum(
+        bool(observation.evidence_sources)
+        and all(source in available_sources for source in observation.evidence_sources)
+        for observation in report_observations
+    )
+    unsupported_matches = {
+        claim: "matched" if claim.casefold() in answer.casefold() else "not_detected"
+        for claim in scenario.unsupported_claims
+    }
     return {
         "status": result.status,
         "tool_calls": actual_calls,
@@ -118,6 +154,23 @@ def score_result(scenario: Scenario, result: AgentResult) -> dict[str, Any]:
         },
         "unsupported_claims": {claim: "unverified" for claim in scenario.unsupported_claims},
         "output_schema": "compliant" if schema_ok else "failed",
+        "output_mode": result.output_mode,
+        "format_compliance": result.format_compliance,
+        "response_format_status": result.response_format_status,
+        "response_format_status_code": result.response_format_status_code,
+        "evidence_attribution": {
+            "status": "measured" if report is not None else "not_applicable",
+            "method": "successful_tool_name_match; does_not_verify_statement_support",
+            "matched": attribution_matches,
+            "total": len(report_observations),
+            "rate": attribution_matches / len(report_observations) if report_observations else None,
+        },
+        "approximate_unsupported_claim_screen": {
+            "method": "case_insensitive_exact_phrase_match",
+            "label": "approximate; not a verified hallucination rate",
+            "matches": unsupported_matches,
+            "count": sum(value == "matched" for value in unsupported_matches.values()),
+        },
         "execution_errors": errors,
         "task_success": task_success,
     }
@@ -128,6 +181,7 @@ async def evaluate(
     trials: int = 1,
     baseline: Path | None = None,
     strategy: ExecutionStrategy = "autonomous",
+    output_mode: OutputMode = "free_text",
 ) -> dict[str, Any]:
     settings = Settings.from_env()
     scenarios = load_scenarios()
@@ -136,7 +190,7 @@ async def evaluate(
     for scenario in scenarios:
         for trial in range(trials):
             if mode == "mock":
-                model: Any = ScenarioModel(scenario, strategy)
+                model: Any = ScenarioModel(scenario, strategy, output_mode)
             else:
                 model = OpenAIClient(settings)
             runtime_settings = Settings(
@@ -152,6 +206,7 @@ async def evaluate(
                 scenario.task,
                 strategy=strategy,
                 workflow=(scenario.deterministic_workflow if strategy == "deterministic" else None),
+                output_mode=output_mode,
             )
             if isinstance(model, OpenAIClient):
                 resolved_model_id = model.model_id or resolved_model_id
@@ -166,6 +221,7 @@ async def evaluate(
                     "prompt_tokens": result.prompt_tokens,
                     "completion_tokens": result.completion_tokens,
                     "termination_reason": result.termination_reason,
+                    "model_identity": resolved_model_id,
                 }
             )
     report: dict[str, Any] = {
@@ -174,6 +230,7 @@ async def evaluate(
             "evaluation_scope": "harness_behavior" if mode == "mock" else "live_model_behavior",
             "tool_data_scope": "scenario_fixtures",
             "strategy": strategy,
+            "output_mode": output_mode,
             "model": resolved_model_id,
             "dataset": "aiops-v1",
             "harness_version": "0.1.0",
@@ -181,6 +238,22 @@ async def evaluate(
                 "base_url": settings.llm_base_url,
                 "temperature": settings.temperature,
                 "tool_protocol": settings.tool_protocol,
+            },
+            "response_format_config": {
+                "mode": output_mode,
+                "prompt_schema": IncidentReport.model_json_schema()
+                if output_mode in {"prompt_json", "schema_json"}
+                else None,
+                "response_format": {
+                    "type": "json_object",
+                    "schema": IncidentReport.model_json_schema(),
+                }
+                if output_mode == "schema_json"
+                else None,
+                "prompt_schema_included": output_mode in {"prompt_json", "schema_json"},
+                "server_acceptance_semantics": (
+                    "HTTP 2xx means request accepted; it does not prove schema enforcement."
+                ),
             },
             "configuration": {
                 "max_iterations": settings.max_iterations,
@@ -205,6 +278,35 @@ async def evaluate(
             "tool_selection_failures": sum(not row["tool_selection_accuracy"] for row in results),
             "evaluation_failures": sum(not row["evaluation_assertions_passed"] for row in results),
             "infrastructure_errors": sum(row["infrastructure_error"] for row in results),
+            "format_compliance": {
+                state: sum(row["format_compliance"] == state for row in results)
+                for state in ("valid", "invalid", "not_produced", "not_applicable")
+            },
+            "response_format_status": {
+                state: sum(row["response_format_status"] == state for row in results)
+                for state in ("accepted", "rejected", "unknown", "not_requested")
+            },
+            "factual_coverage": {
+                "covered": sum(
+                    sum(value == "covered" for value in row["required_facts"].values())
+                    for row in results
+                ),
+                "total": sum(len(row["required_facts"]) for row in results),
+            },
+            "evidence_attribution": {
+                "method": "successful_tool_name_match; does_not_verify_statement_support",
+                "matched": sum(row["evidence_attribution"]["matched"] for row in results),
+                "total": sum(row["evidence_attribution"]["total"] for row in results),
+            },
+            "approximate_unsupported_claim_screen": {
+                "label": "approximate; not a verified hallucination rate",
+                "matches": sum(
+                    row["approximate_unsupported_claim_screen"]["count"] for row in results
+                ),
+                "assertions": sum(
+                    len(row["approximate_unsupported_claim_screen"]["matches"]) for row in results
+                ),
+            },
             "required_evidence_coverage": {
                 "covered": sum(row["required_evidence_coverage"]["covered"] for row in results),
                 "attempted": sum(row["required_evidence_coverage"]["attempted"] for row in results),
@@ -221,6 +323,16 @@ async def evaluate(
     }
     evidence = report["summary"]["required_evidence_coverage"]
     evidence["rate"] = evidence["covered"] / evidence["total"] if evidence["total"] else 1.0
+    report_facts = report["summary"]["factual_coverage"]
+    report_facts["rate"] = (
+        report_facts["covered"] / report_facts["total"] if report_facts["total"] else 1.0
+    )
+    report_attribution = report["summary"]["evidence_attribution"]
+    report_attribution["rate"] = (
+        report_attribution["matched"] / report_attribution["total"]
+        if report_attribution["total"]
+        else None
+    )
     for scenario in scenarios:
         rows = [row for row in results if row["test_id"] == scenario.test_id]
         report["summary"]["by_scenario"][scenario.test_id] = {
@@ -229,6 +341,29 @@ async def evaluate(
             "tool_selection_passed": sum(row["tool_selection_accuracy"] for row in rows),
             "evaluation_failures": sum(not row["evaluation_assertions_passed"] for row in rows),
             "infrastructure_errors": sum(row["infrastructure_error"] for row in rows),
+            "format_compliance": {
+                state: sum(row["format_compliance"] == state for row in rows)
+                for state in ("valid", "invalid", "not_produced", "not_applicable")
+            },
+            "response_format_status": {
+                state: sum(row["response_format_status"] == state for row in rows)
+                for state in ("accepted", "rejected", "unknown", "not_requested")
+            },
+            "factual_coverage": {
+                "covered": sum(
+                    sum(value == "covered" for value in row["required_facts"].values())
+                    for row in rows
+                ),
+                "total": sum(len(row["required_facts"]) for row in rows),
+            },
+            "evidence_attribution": {
+                "method": "successful_tool_name_match; does_not_verify_statement_support",
+                "matched": sum(row["evidence_attribution"]["matched"] for row in rows),
+                "total": sum(row["evidence_attribution"]["total"] for row in rows),
+            },
+            "approximate_unsupported_claim_matches": sum(
+                row["approximate_unsupported_claim_screen"]["count"] for row in rows
+            ),
             "required_evidence_coverage": {
                 "covered": sum(row["required_evidence_coverage"]["covered"] for row in rows),
                 "total": sum(row["required_evidence_coverage"]["total"] for row in rows),
@@ -257,13 +392,24 @@ def main() -> None:
     parser.add_argument(
         "--strategy", choices=["autonomous", "guided", "deterministic"], default="autonomous"
     )
+    parser.add_argument(
+        "--output-mode", choices=["free_text", "prompt_json", "schema_json"], default="free_text"
+    )
     parser.add_argument("--trials", type=int, default=1)
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--output", type=Path, default=Path("reports/latest.json"))
     args = parser.parse_args()
     if args.trials < 1:
         parser.error("--trials must be at least 1")
-    report = asyncio.run(evaluate(args.mode, args.trials, args.baseline, strategy=args.strategy))
+    report = asyncio.run(
+        evaluate(
+            args.mode,
+            args.trials,
+            args.baseline,
+            strategy=args.strategy,
+            output_mode=args.output_mode,
+        )
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report["summary"], indent=2))

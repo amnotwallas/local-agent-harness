@@ -49,9 +49,13 @@ async def test_runtime_executes_authorized_tool_and_returns_trace() -> None:
 async def test_guided_strategy_validates_and_executes_a_complete_plan() -> None:
     class GuidedModel:
         calls = 0
+        final_prompt: str | None = None
 
         async def chat(
-            self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+            self,
+            messages: list[dict[str, Any]],
+            tools: list[dict[str, Any]] | None = None,
+            response_format: dict[str, Any] | None = None,
         ) -> ChatResult:
             self.calls += 1
             if self.calls == 1:
@@ -70,6 +74,7 @@ async def test_guided_strategy_validates_and_executes_a_complete_plan() -> None:
                     ]
                 )
             assert tools is None
+            self.final_prompt = messages[-1]["content"]
             return ChatResult(content="Evidence gathered.")
 
     model = GuidedModel()
@@ -83,6 +88,10 @@ async def test_guided_strategy_validates_and_executes_a_complete_plan() -> None:
         "get_recent_logs",
     ]
     assert model.calls == 2
+    assert model.final_prompt == (
+        "Summarize the results of the completed investigation. Use only the evidence above, "
+        "describe missing or failed evidence, and state uncertainty."
+    )
 
 
 @pytest.mark.asyncio
@@ -582,3 +591,171 @@ async def test_execution_deadline_cancels_a_tool_call() -> None:
     assert result.status == "deadline_exceeded"
     assert result.termination_reason == "execution_deadline"
     assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_schema_json_is_requested_only_for_final_synthesis_after_tool_calls() -> None:
+    from agent_harness.agents.incident_report import IncidentReport
+
+    valid_report = IncidentReport(
+        confirmed_observations=[],
+        hypotheses=[],
+        missing_evidence=[],
+        tool_failures=[],
+    ).model_dump_json()
+
+    class SchemaModel:
+        calls: list[tuple[list[dict[str, Any]], list[dict[str, Any]] | None, Any]] = []
+
+        async def chat(
+            self,
+            messages: list[dict[str, Any]],
+            tools: list[dict[str, Any]] | None = None,
+            response_format: dict[str, Any] | None = None,
+        ) -> ChatResult:
+            self.calls.append((messages, tools, response_format))
+            if len(self.calls) == 1:
+                return ChatResult(
+                    tool_calls=[
+                        ToolCall(
+                            id="health",
+                            name="get_service_health",
+                            arguments={"service_name": "orders-api"},
+                        )
+                    ]
+                )
+            if len(self.calls) == 2:
+                return ChatResult(content="Investigation complete.")
+            return ChatResult(content=valid_report, response_format_status="accepted")
+
+    model = SchemaModel()
+    result = await AgentRuntime(model, build_registry(), Settings()).run(
+        "Check orders-api", output_mode="schema_json"
+    )
+
+    assert result.status == "completed"
+    assert result.format_compliance == "valid"
+    assert result.incident_report is not None
+    assert len(model.calls) == 3
+    assert model.calls[0][1] is not None
+    assert model.calls[1][1] is not None
+    assert model.calls[2][1] is None
+    assert model.calls[0][2] is None
+    assert model.calls[1][2] is None
+    assert model.calls[2][2] == {
+        "type": "json_object",
+        "schema": IncidentReport.model_json_schema(),
+    }
+
+
+@pytest.mark.asyncio
+async def test_invalid_structured_output_is_retained_without_repair_or_fallback() -> None:
+    class InvalidJsonModel:
+        calls = 0
+
+        async def chat(
+            self,
+            messages: list[dict[str, Any]],
+            tools: list[dict[str, Any]] | None = None,
+            response_format: dict[str, Any] | None = None,
+        ) -> ChatResult:
+            self.calls += 1
+            if self.calls < 3:
+                if self.calls == 1:
+                    return ChatResult(
+                        tool_calls=[
+                            ToolCall(
+                                id="health",
+                                name="get_service_health",
+                                arguments={"service_name": "orders-api"},
+                            )
+                        ]
+                    )
+                return ChatResult(content="Investigation complete.")
+            return ChatResult(content='{"confirmed_observations": []}')
+
+    model = InvalidJsonModel()
+    result = await AgentRuntime(model, build_registry(), Settings()).run(
+        "Check orders-api", output_mode="prompt_json"
+    )
+
+    assert result.status == "completed"
+    assert result.format_compliance == "invalid"
+    assert result.incident_report is None
+    assert result.final_answer == '{"confirmed_observations": []}'
+    assert model.calls == 3
+
+
+@pytest.mark.asyncio
+async def test_rejected_schema_format_is_reported_without_fallback() -> None:
+    from agent_harness.models.client import ModelError
+
+    class RejectingSchemaModel:
+        calls = 0
+
+        async def chat(
+            self,
+            messages: list[dict[str, Any]],
+            tools: list[dict[str, Any]] | None = None,
+            response_format: dict[str, Any] | None = None,
+        ) -> ChatResult:
+            self.calls += 1
+            if self.calls == 1:
+                return ChatResult(
+                    tool_calls=[
+                        ToolCall(
+                            id="health",
+                            name="get_service_health",
+                            arguments={"service_name": "orders-api"},
+                        )
+                    ]
+                )
+            if self.calls == 2:
+                return ChatResult(content="Investigation complete.")
+            assert tools is None
+            assert response_format is not None
+            raise ModelError(
+                "The inference server returned an invalid or failed response",
+                response_format_status="rejected",
+                response_format_status_code=400,
+            )
+
+    model = RejectingSchemaModel()
+    result = await AgentRuntime(model, build_registry(), Settings()).run(
+        "Check orders-api", output_mode="schema_json"
+    )
+
+    assert result.status == "failed"
+    assert result.response_format_status == "rejected"
+    assert result.response_format_status_code == 400
+    assert result.format_compliance == "not_produced"
+    assert model.calls == 3
+
+
+@pytest.mark.asyncio
+async def test_schema_timeout_records_unproduced_format_and_unknown_acceptance() -> None:
+    class SlowSummaryModel:
+        async def chat(
+            self,
+            messages: list[dict[str, Any]],
+            tools: list[dict[str, Any]] | None = None,
+            response_format: dict[str, Any] | None = None,
+        ) -> ChatResult:
+            await asyncio.sleep(1)
+            return ChatResult(content="too late")
+
+    result = await AgentRuntime(
+        SlowSummaryModel(),
+        build_registry(),
+        Settings(execution_timeout=0.05, tool_timeout=0.01),
+    ).run(
+        "Check orders-api",
+        strategy="deterministic",
+        workflow="service_health",
+        output_mode="schema_json",
+    )
+
+    assert result.status == "deadline_exceeded"
+    assert result.output_mode == "schema_json"
+    assert result.format_compliance == "not_produced"
+    assert result.response_format_status == "unknown"

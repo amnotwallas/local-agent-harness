@@ -23,6 +23,7 @@ class RunRequest(BaseModel):
     allowed_tools: list[str] | None = None
     strategy: Literal["autonomous", "guided", "deterministic"] = "autonomous"
     workflow: str | None = None
+    output_mode: Literal["free_text", "prompt_json", "schema_json"] = "free_text"
 
 
 class ErrorResponse(BaseModel):
@@ -112,6 +113,7 @@ def create_app(settings: Settings | None = None, model: Any | None = None) -> Fa
             request.headers.get("x-request-id"),
             strategy=body.strategy,
             workflow=body.workflow,
+            output_mode=body.output_mode,
         )
         if result.status == "deadline_exceeded":
             return JSONResponse(status_code=504, content=result.model_dump(mode="json"))

@@ -2,18 +2,21 @@ import asyncio
 import json
 import logging
 from time import perf_counter
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, cast
 from uuid import uuid4
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
+from agent_harness.agents.incident_report import IncidentReport
 from agent_harness.agents.workflows import build_workflow_plan
 from agent_harness.config import Settings
-from agent_harness.models.client import ChatResult, ModelError, ToolCall
+from agent_harness.models.client import ChatResult, ModelError, ResponseFormatStatus, ToolCall
 from agent_harness.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 ExecutionStrategy = Literal["autonomous", "guided", "deterministic"]
+OutputMode = Literal["free_text", "prompt_json", "schema_json"]
+FormatCompliance = Literal["not_applicable", "valid", "invalid", "not_produced"]
 
 
 class Model(Protocol):
@@ -51,6 +54,11 @@ class AgentResult(BaseModel):
     termination_reason: str = ""
     strategy: str = "autonomous"
     workflow: str | None = None
+    output_mode: str = "free_text"
+    incident_report: IncidentReport | None = None
+    format_compliance: FormatCompliance = "not_applicable"
+    response_format_status: ResponseFormatStatus = "not_requested"
+    response_format_status_code: int | None = None
 
 
 class AgentRuntime:
@@ -65,6 +73,7 @@ class AgentRuntime:
         request_id: str | None = None,
         strategy: ExecutionStrategy = "autonomous",
         workflow: str | None = None,
+        output_mode: OutputMode = "free_text",
     ) -> AgentResult:
         started = perf_counter()
         deadline = started + self.settings.execution_timeout
@@ -93,6 +102,23 @@ class AgentRuntime:
         model_duration_ms = 0.0
         tool_calls_executed = 0
         protocol = self.settings.tool_protocol
+        if output_mode not in {"free_text", "prompt_json", "schema_json"}:
+            return self._result(
+                request_id,
+                execution_id,
+                "failed",
+                None,
+                history,
+                started,
+                model_calls,
+                prompt_tokens,
+                completion_tokens,
+                model_duration_ms,
+                "invalid_output_mode",
+                strategy,
+                workflow,
+                output_mode,
+            )
         if strategy not in {"autonomous", "guided", "deterministic"}:
             return self._result(
                 request_id,
@@ -127,9 +153,10 @@ class AgentRuntime:
             )
         if protocol == "json":
             messages[0]["content"] += (
-                ' Return only JSON: {"tool_calls":[{"id":string,"name":string,"arguments":object}]}'
-                ' or {"final":string}. Do not use other tools. Allowed schemas: '
-                + json.dumps(self.registry.schemas())
+                " When tools are being selected, return only JSON: "
+                '{"tool_calls":[{"id":string,"name":string,"arguments":object}]}. '
+                "When asked for a final answer, follow that answer format instead. "
+                "Do not use other tools. Allowed schemas: " + json.dumps(self.registry.schemas())
             )
 
         if strategy != "autonomous":
@@ -180,6 +207,7 @@ class AgentRuntime:
                 prompt_tokens,
                 completion_tokens,
                 model_duration_ms,
+                output_mode,
             )
 
         for _ in range(self.settings.max_iterations):
@@ -225,6 +253,40 @@ class AgentRuntime:
                 if not calls:
                     if not isinstance(final, str) or not final.strip():
                         raise ValueError("Model returned no final response")
+                    if output_mode == "free_text":
+                        logger.info(
+                            "agent completed request_id=%s execution_id=%s model_calls=%d",
+                            request_id,
+                            execution_id,
+                            model_calls,
+                        )
+                        return self._result(
+                            request_id,
+                            execution_id,
+                            "completed",
+                            final,
+                            history,
+                            started,
+                            model_calls,
+                            prompt_tokens,
+                            completion_tokens,
+                            model_duration_ms,
+                            "final_response",
+                            strategy,
+                            workflow,
+                            output_mode,
+                        )
+                    messages.append({"role": "assistant", "content": response.content})
+                    model_calls += 1
+                    (
+                        summary,
+                        final,
+                        incident_report,
+                        format_compliance,
+                    ) = await self._synthesize(messages, protocol, output_mode, deadline)
+                    prompt_tokens += summary.prompt_tokens or 0
+                    completion_tokens += summary.completion_tokens or 0
+                    model_duration_ms += summary.duration_ms
                     logger.info(
                         "agent completed request_id=%s execution_id=%s model_calls=%d",
                         request_id,
@@ -243,6 +305,13 @@ class AgentRuntime:
                         completion_tokens,
                         model_duration_ms,
                         "final_response",
+                        strategy,
+                        workflow,
+                        output_mode,
+                        incident_report,
+                        format_compliance,
+                        summary.response_format_status,
+                        summary.response_format_status_code,
                     )
                 tool_messages, execution_status = await self._execute_tool_calls(
                     calls, history, deadline, request_id, execution_id, tool_calls_executed
@@ -279,8 +348,17 @@ class AgentRuntime:
                     completion_tokens,
                     model_duration_ms,
                     "execution_deadline",
+                    strategy,
+                    workflow,
+                    output_mode,
+                    format_compliance=(
+                        "not_produced" if output_mode != "free_text" else "not_applicable"
+                    ),
+                    response_format_status=(
+                        "unknown" if output_mode == "schema_json" else "not_requested"
+                    ),
                 )
-            except (ModelError, ValueError, TypeError, json.JSONDecodeError):
+            except (ModelError, ValueError, TypeError, json.JSONDecodeError) as exc:
                 return self._result(
                     request_id,
                     execution_id,
@@ -295,6 +373,18 @@ class AgentRuntime:
                     "model_or_protocol_error",
                     strategy,
                     workflow,
+                    output_mode,
+                    format_compliance=(
+                        "not_produced" if output_mode != "free_text" else "not_applicable"
+                    ),
+                    response_format_status=(
+                        exc.response_format_status
+                        if isinstance(exc, ModelError)
+                        else "not_requested"
+                    ),
+                    response_format_status_code=(
+                        exc.response_format_status_code if isinstance(exc, ModelError) else None
+                    ),
                 )
         return self._result(
             request_id,
@@ -328,6 +418,7 @@ class AgentRuntime:
         prompt_tokens: int,
         completion_tokens: int,
         model_duration_ms: float,
+        output_mode: OutputMode,
     ) -> AgentResult:
         try:
             if strategy == "guided":
@@ -456,25 +547,16 @@ class AgentRuntime:
                     workflow,
                 )
             messages.extend(tool_messages)
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "Summarize the results of the completed investigation. Use only the "
-                        "evidence above, describe missing or failed evidence, and state "
-                        "uncertainty."
-                    ),
-                }
-            )
-            remaining = deadline - perf_counter()
-            if remaining <= 0:
-                raise TimeoutError
             model_calls += 1
-            summary = await asyncio.wait_for(self.model.chat(messages, None), timeout=remaining)
+            (
+                summary,
+                final,
+                incident_report,
+                format_compliance,
+            ) = await self._synthesize(messages, protocol, output_mode, deadline)
             prompt_tokens += summary.prompt_tokens or 0
             completion_tokens += summary.completion_tokens or 0
             model_duration_ms += summary.duration_ms
-            final = summary.content if protocol == "native" else self._json_final(summary.content)
             if not isinstance(final, str) or not final.strip():
                 raise ValueError("Model returned no final response")
             return self._result(
@@ -491,6 +573,11 @@ class AgentRuntime:
                 "final_response",
                 strategy,
                 workflow,
+                output_mode,
+                incident_report,
+                format_compliance,
+                summary.response_format_status,
+                summary.response_format_status_code,
             )
         except TimeoutError:
             return self._result(
@@ -507,8 +594,15 @@ class AgentRuntime:
                 "execution_deadline",
                 strategy,
                 workflow,
+                output_mode,
+                format_compliance=(
+                    "not_produced" if output_mode != "free_text" else "not_applicable"
+                ),
+                response_format_status=(
+                    "unknown" if output_mode == "schema_json" else "not_requested"
+                ),
             )
-        except (ModelError, ValueError, TypeError, json.JSONDecodeError):
+        except (ModelError, ValueError, TypeError, json.JSONDecodeError) as exc:
             return self._result(
                 request_id,
                 execution_id,
@@ -523,7 +617,69 @@ class AgentRuntime:
                 "invalid_tool_plan" if strategy == "guided" else "model_or_protocol_error",
                 strategy,
                 workflow,
+                output_mode,
+                format_compliance=(
+                    "not_produced" if output_mode != "free_text" else "not_applicable"
+                ),
+                response_format_status=(
+                    exc.response_format_status if isinstance(exc, ModelError) else "not_requested"
+                ),
+                response_format_status_code=(
+                    exc.response_format_status_code if isinstance(exc, ModelError) else None
+                ),
             )
+
+    async def _synthesize(
+        self,
+        messages: list[dict[str, Any]],
+        protocol: str,
+        output_mode: OutputMode,
+        deadline: float,
+    ) -> tuple[ChatResult, str, IncidentReport | None, FormatCompliance]:
+        response_format = None
+        if output_mode == "free_text":
+            instruction = (
+                "Summarize the results of the completed investigation. Use only the evidence "
+                "above, describe missing or failed evidence, and state uncertainty."
+            )
+        else:
+            schema = IncidentReport.model_json_schema()
+            instruction = (
+                "Produce the final incident response using only the investigation evidence "
+                "above. Separate observations from hypotheses, disclose missing evidence and "
+                "tool failures, and state uncertainty."
+            ) + (
+                " Return only one JSON object matching this schema exactly; include every "
+                "required field and no additional properties: "
+                + json.dumps(schema, separators=(",", ":"))
+            )
+            if output_mode == "schema_json":
+                response_format = {"type": "json_object", "schema": schema}
+        messages.append({"role": "user", "content": instruction})
+        remaining = deadline - perf_counter()
+        if remaining <= 0:
+            raise TimeoutError
+        if response_format is None:
+            response = await asyncio.wait_for(self.model.chat(messages, None), timeout=remaining)
+        else:
+            response = await asyncio.wait_for(
+                cast(Any, self.model).chat(messages, None, response_format), timeout=remaining
+            )
+        content = response.content
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("Model returned no final response")
+        final = (
+            self._json_final(content)
+            if output_mode == "free_text" and protocol == "json"
+            else content
+        )
+        if output_mode == "free_text":
+            return response, final or "", None, "not_applicable"
+        try:
+            report = IncidentReport.model_validate_json(content, strict=True)
+        except ValidationError:
+            return response, content, None, "invalid"
+        return response, content, report, "valid"
 
     async def _execute_tool_calls(
         self,
@@ -648,6 +804,11 @@ class AgentRuntime:
         reason: str,
         strategy: str = "autonomous",
         workflow: str | None = None,
+        output_mode: str = "free_text",
+        incident_report: IncidentReport | None = None,
+        format_compliance: FormatCompliance = "not_applicable",
+        response_format_status: ResponseFormatStatus = "not_requested",
+        response_format_status_code: int | None = None,
     ) -> AgentResult:
         return AgentResult(
             request_id=request_id,
@@ -663,4 +824,9 @@ class AgentRuntime:
             termination_reason=reason,
             strategy=strategy,
             workflow=workflow,
+            output_mode=output_mode,
+            incident_report=incident_report,
+            format_compliance=format_compliance,
+            response_format_status=response_format_status,
+            response_format_status_code=response_format_status_code,
         )

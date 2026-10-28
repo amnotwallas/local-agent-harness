@@ -112,6 +112,44 @@ async def test_agent_response_schema_is_published_in_openapi() -> None:
     assert "422" in schema["paths"]["/agents/run"]["post"]["responses"]
     assert "502" in schema["paths"]["/agents/run"]["post"]["responses"]
     assert "504" in schema["paths"]["/agents/run"]["post"]["responses"]
+    assert "incident_report" in schema["components"]["schemas"]["AgentResult"]["properties"]
+    assert (
+        schema["components"]["schemas"]["RunRequest"]["properties"]["output_mode"]["default"]
+        == "free_text"
+    )
+
+
+@pytest.mark.asyncio
+async def test_api_returns_typed_incident_report_when_requested() -> None:
+    class ReportModel:
+        async def chat(
+            self,
+            messages: list[dict[str, Any]],
+            tools: list[dict[str, Any]] | None = None,
+            response_format: dict[str, Any] | None = None,
+        ) -> ChatResult:
+            if tools is not None:
+                return ChatResult(content="Ready to summarize.")
+            return ChatResult(
+                content=(
+                    '{"confirmed_observations":[],"hypotheses":[],"missing_evidence":[],'
+                    '"tool_failures":[]}'
+                ),
+                response_format_status="accepted" if response_format else "not_requested",
+            )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=create_app(settings=Settings(), model=ReportModel())),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/agents/run",
+            json={"task": "Review system status", "output_mode": "schema_json"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["incident_report"]["hypotheses"] == []
+    assert response.json()["format_compliance"] == "valid"
 
 
 @pytest.mark.asyncio

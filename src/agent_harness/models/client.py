@@ -2,7 +2,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from time import perf_counter
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -10,10 +10,19 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from agent_harness.config import Settings
 
 logger = logging.getLogger(__name__)
+ResponseFormatStatus = Literal["not_requested", "accepted", "rejected", "unknown"]
 
 
 class ModelError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        response_format_status: ResponseFormatStatus = "not_requested",
+        response_format_status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.response_format_status = response_format_status
+        self.response_format_status_code = response_format_status_code
 
 
 class ToolCall(BaseModel):
@@ -31,6 +40,8 @@ class ChatResult:
     completion_tokens: int | None = None
     raw_tool_calls: list[dict[str, Any]] = field(default_factory=list)
     duration_ms: float = 0.0
+    response_format_status: ResponseFormatStatus = "not_requested"
+    response_format_status_code: int | None = None
 
 
 class OpenAIClient:
@@ -64,7 +75,10 @@ class OpenAIClient:
         return self._model
 
     async def chat(
-        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> ChatResult:
         model = await self.discover_model()
         body: dict[str, Any] = {
@@ -76,12 +90,26 @@ class OpenAIClient:
         }
         if tools:
             body.update(tools=tools, tool_choice="auto")
+        if response_format is not None:
+            body["response_format"] = response_format
         start = perf_counter()
+        format_status: ResponseFormatStatus = (
+            "unknown" if response_format is not None else "not_requested"
+        )
+        status_code = None
         try:
             response = await self._client.post(
                 f"{self.settings.llm_base_url.rstrip('/')}/chat/completions", json=body
             )
-            response.raise_for_status()
+            status_code = response.status_code
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError:
+                if response_format is not None and status_code < 500:
+                    format_status = "rejected"
+                raise
+            if response_format is not None:
+                format_status = "accepted"
             payload = response.json()
             choice = payload["choices"][0]["message"]
             raw_calls = choice.get("tool_calls", [])
@@ -101,6 +129,8 @@ class OpenAIClient:
                 prompt_tokens=usage.get("prompt_tokens"),
                 completion_tokens=usage.get("completion_tokens"),
                 duration_ms=(perf_counter() - start) * 1000,
+                response_format_status=format_status,
+                response_format_status_code=status_code,
             )
         except (
             httpx.HTTPError,
@@ -112,4 +142,8 @@ class OpenAIClient:
             ValidationError,
         ) as exc:
             logger.warning("Model request failed (%s)", type(exc).__name__)
-            raise ModelError("The inference server returned an invalid or failed response") from exc
+            raise ModelError(
+                "The inference server returned an invalid or failed response",
+                response_format_status=format_status,
+                response_format_status_code=status_code,
+            ) from exc

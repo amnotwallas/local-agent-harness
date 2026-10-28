@@ -1,6 +1,7 @@
 import pytest
 
-from agent_harness.agents.runtime import AgentResult, ExecutionStrategy, ToolExecution
+from agent_harness.agents.incident_report import EvidenceStatement, IncidentReport
+from agent_harness.agents.runtime import AgentResult, ExecutionStrategy, OutputMode, ToolExecution
 from agent_harness.evals.runner import evaluate, score_result
 from agent_harness.evals.scenarios import ExpectedCall, load_scenarios
 
@@ -44,6 +45,75 @@ async def test_mock_report_records_strategy_and_resource_metrics(
     assert report["summary"]["task_successes"] == 10
     assert "mean_tool_calls" in report["summary"]
     assert "required_evidence_coverage" in report["summary"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strategy", ["autonomous", "guided", "deterministic"])
+@pytest.mark.parametrize("output_mode", ["free_text", "prompt_json", "schema_json"])
+async def test_mock_evaluation_keeps_scoring_dimensions_separate(
+    strategy: ExecutionStrategy, output_mode: OutputMode
+) -> None:
+    report = await evaluate(mode="mock", strategy=strategy, output_mode=output_mode)
+
+    assert report["metadata"]["output_mode"] == output_mode
+    format_config = report["metadata"]["response_format_config"]
+    assert format_config["prompt_schema"] == (
+        IncidentReport.model_json_schema() if output_mode != "free_text" else None
+    )
+    assert format_config["response_format"] == (
+        {"type": "json_object", "schema": IncidentReport.model_json_schema()}
+        if output_mode == "schema_json"
+        else None
+    )
+    assert report["summary"]["task_successes"] == 10
+    assert report["summary"]["factual_coverage"]["total"] > 0
+    assert "format_compliance" in report["summary"]
+    assert "evidence_attribution" in report["summary"]
+    assert report["summary"]["approximate_unsupported_claim_screen"]["label"].startswith(
+        "approximate"
+    )
+    assert all(
+        row["format_compliance"] == ("not_applicable" if output_mode == "free_text" else "valid")
+        for row in report["results"]
+    )
+
+
+def test_output_format_and_attribution_do_not_change_task_success() -> None:
+    scenario = next(s for s in load_scenarios() if s.test_id == "healthy-service")
+    report = IncidentReport(
+        confirmed_observations=[
+            EvidenceStatement(statement="orders-api is healthy", evidence_sources=["not-a-tool"])
+        ],
+        hypotheses=[],
+        missing_evidence=[],
+        tool_failures=[],
+    )
+    result = AgentResult(
+        request_id="r",
+        execution_id="e",
+        status="completed",
+        final_answer="orders-api is healthy",
+        tool_history=[
+            ToolExecution(
+                tool_name="get_service_health",
+                arguments={"service_name": "orders-api"},
+                result={},
+                arguments_valid=True,
+            )
+        ],
+        total_execution_time_ms=1,
+        model_calls=1,
+        termination_reason="final_response",
+        output_mode="prompt_json",
+        incident_report=report,
+        format_compliance="invalid",
+    )
+
+    scored = score_result(scenario, result)
+
+    assert scored["task_success"] is True
+    assert scored["format_compliance"] == "invalid"
+    assert scored["evidence_attribution"]["matched"] == 0
 
 
 def test_required_fact_presence_affects_success_without_claiming_truth() -> None:

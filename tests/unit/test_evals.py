@@ -1,6 +1,6 @@
 import pytest
 
-from agent_harness.agents.runtime import AgentResult, ToolExecution
+from agent_harness.agents.runtime import AgentResult, ExecutionStrategy, ToolExecution
 from agent_harness.evals.runner import evaluate, score_result
 from agent_harness.evals.scenarios import ExpectedCall, load_scenarios
 
@@ -31,6 +31,19 @@ async def test_mock_evaluation_completes_every_scenario() -> None:
     report = await evaluate(mode="mock")
     assert report["summary"]["task_successes"] == 10
     assert report["metadata"]["evaluation_scope"] == "harness_behavior"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strategy", ["autonomous", "guided", "deterministic"])
+async def test_mock_report_records_strategy_and_resource_metrics(
+    strategy: ExecutionStrategy,
+) -> None:
+    report = await evaluate(mode="mock", strategy=strategy)
+
+    assert report["metadata"]["strategy"] == strategy
+    assert report["summary"]["task_successes"] == 10
+    assert "mean_tool_calls" in report["summary"]
+    assert "required_evidence_coverage" in report["summary"]
 
 
 def test_required_fact_presence_affects_success_without_claiming_truth() -> None:

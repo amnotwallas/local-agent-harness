@@ -3,7 +3,7 @@ from typing import Any
 
 import pytest
 
-from agent_harness.agents.runtime import AgentRuntime
+from agent_harness.agents.runtime import AgentRuntime, ExecutionStrategy
 from agent_harness.config import Settings
 from agent_harness.models.client import ChatResult, ToolCall
 from agent_harness.tools.registry import build_registry
@@ -43,6 +43,278 @@ async def test_runtime_executes_authorized_tool_and_returns_trace() -> None:
     assert [item.tool_name for item in result.tool_history] == ["get_service_health"]
     assert result.model_calls == 2
     assert result.termination_reason == "final_response"
+
+
+@pytest.mark.asyncio
+async def test_guided_strategy_validates_and_executes_a_complete_plan() -> None:
+    class GuidedModel:
+        calls = 0
+
+        async def chat(
+            self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+        ) -> ChatResult:
+            self.calls += 1
+            if self.calls == 1:
+                return ChatResult(
+                    tool_calls=[
+                        ToolCall(
+                            id="health",
+                            name="get_service_health",
+                            arguments={"service_name": "orders-api"},
+                        ),
+                        ToolCall(
+                            id="logs",
+                            name="get_recent_logs",
+                            arguments={"service_name": "orders-api", "severity": "ERROR"},
+                        ),
+                    ]
+                )
+            assert tools is None
+            return ChatResult(content="Evidence gathered.")
+
+    model = GuidedModel()
+    result = await AgentRuntime(model, build_registry(), Settings()).run(
+        "Investigate orders-api", strategy="guided"
+    )
+
+    assert result.status == "completed"
+    assert [item.tool_name for item in result.tool_history] == [
+        "get_service_health",
+        "get_recent_logs",
+    ]
+    assert model.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_guided_strategy_rejects_the_entire_invalid_plan_before_execution() -> None:
+    class InvalidPlanModel:
+        async def chat(
+            self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+        ) -> ChatResult:
+            return ChatResult(
+                tool_calls=[
+                    ToolCall(
+                        id="valid-first",
+                        name="get_service_health",
+                        arguments={"service_name": "orders-api"},
+                    ),
+                    ToolCall(id="invalid-second", name="shell", arguments={}),
+                ]
+            )
+
+    result = await AgentRuntime(InvalidPlanModel(), build_registry(), Settings()).run(
+        "Check orders-api", strategy="guided"
+    )
+
+    assert result.status == "failed"
+    assert result.termination_reason == "invalid_tool_plan"
+    assert result.tool_history == []
+
+
+@pytest.mark.asyncio
+async def test_guided_strategy_rejects_invalid_arguments_before_any_execution() -> None:
+    class InvalidPlanModel:
+        async def chat(
+            self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+        ) -> ChatResult:
+            return ChatResult(
+                tool_calls=[
+                    ToolCall(
+                        id="valid-first",
+                        name="get_service_health",
+                        arguments={"service_name": "orders-api"},
+                    ),
+                    ToolCall(
+                        id="invalid-second",
+                        name="get_recent_logs",
+                        arguments={"severity": "TRACE"},
+                    ),
+                ]
+            )
+
+    result = await AgentRuntime(InvalidPlanModel(), build_registry(), Settings()).run(
+        "Check orders-api", strategy="guided"
+    )
+
+    assert result.status == "failed"
+    assert result.termination_reason == "invalid_tool_plan"
+    assert result.tool_history == []
+
+
+@pytest.mark.asyncio
+async def test_guided_strategy_checks_full_plan_against_tool_call_cap() -> None:
+    class TwoCallPlanModel:
+        async def chat(
+            self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+        ) -> ChatResult:
+            return ChatResult(
+                tool_calls=[
+                    ToolCall(
+                        id="health",
+                        name="get_service_health",
+                        arguments={"service_name": "orders-api"},
+                    ),
+                    ToolCall(
+                        id="logs",
+                        name="get_recent_logs",
+                        arguments={"service_name": "orders-api"},
+                    ),
+                ]
+            )
+
+    result = await AgentRuntime(
+        TwoCallPlanModel(), build_registry(), Settings(max_tool_calls=1)
+    ).run("Check orders-api", strategy="guided")
+
+    assert result.status == "tool_call_limit_reached"
+    assert result.tool_history == []
+
+
+@pytest.mark.asyncio
+async def test_guided_strategy_rejects_plan_that_cannot_fit_remaining_time_budget() -> None:
+    class TwoCallPlanModel:
+        async def chat(
+            self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+        ) -> ChatResult:
+            return ChatResult(
+                tool_calls=[
+                    ToolCall(
+                        id="health",
+                        name="get_service_health",
+                        arguments={"service_name": "orders-api"},
+                    ),
+                    ToolCall(
+                        id="logs",
+                        name="get_recent_logs",
+                        arguments={"service_name": "orders-api"},
+                    ),
+                ]
+            )
+
+    result = await AgentRuntime(
+        TwoCallPlanModel(),
+        build_registry(),
+        Settings(execution_timeout=1, tool_timeout=0.7),
+    ).run("Check orders-api", strategy="guided")
+
+    assert result.status == "deadline_exceeded"
+    assert result.termination_reason == "plan_exceeds_time_budget"
+    assert result.tool_history == []
+
+
+@pytest.mark.asyncio
+async def test_deterministic_strategy_requires_a_known_workflow() -> None:
+    result = await AgentRuntime(ScriptedModel(), build_registry(), Settings()).run(
+        "Check orders-api", strategy="deterministic"
+    )
+
+    assert result.status == "failed"
+    assert result.termination_reason == "missing_workflow"
+
+
+@pytest.mark.asyncio
+async def test_deterministic_strategy_rejects_unknown_workflow() -> None:
+    result = await AgentRuntime(ScriptedModel(), build_registry(), Settings()).run(
+        "Check orders-api", strategy="deterministic", workflow="scenario-id"
+    )
+
+    assert result.status == "failed"
+    assert result.termination_reason == "unknown_workflow"
+    assert result.tool_history == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strategy", ["autonomous", "guided", "deterministic"])
+async def test_each_strategy_enforces_end_to_end_deadline(strategy: ExecutionStrategy) -> None:
+    class SlowModel:
+        async def chat(
+            self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+        ) -> ChatResult:
+            await asyncio.sleep(1)
+            return ChatResult(content="too late")
+
+    result = await AgentRuntime(
+        SlowModel(),
+        build_registry(),
+        Settings(execution_timeout=0.05, tool_timeout=0.01),
+    ).run(
+        "Check unknown-api",
+        strategy=strategy,
+        workflow="service_health" if strategy == "deterministic" else None,
+    )
+
+    assert result.status == "deadline_exceeded"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strategy", ["autonomous", "guided", "deterministic"])
+async def test_tool_failures_are_traced_for_each_strategy(strategy: ExecutionStrategy) -> None:
+    class ToolFailureModel:
+        calls = 0
+
+        async def chat(
+            self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+        ) -> ChatResult:
+            self.calls += 1
+            if strategy != "deterministic" and self.calls == 1:
+                return ChatResult(
+                    tool_calls=[
+                        ToolCall(
+                            id="health",
+                            name="get_service_health",
+                            arguments={"service_name": "unknown-api"},
+                        )
+                    ]
+                )
+            return ChatResult(content="The health lookup failed; status is unavailable.")
+
+    result = await AgentRuntime(ToolFailureModel(), build_registry(), Settings()).run(
+        "Check unknown-api",
+        strategy=strategy,
+        workflow="service_health" if strategy == "deterministic" else None,
+    )
+
+    assert result.status == "completed"
+    assert len(result.tool_history) == 1
+    assert result.tool_history[0].error == "Tool execution failed"
+    assert result.tool_history[0].arguments_valid is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strategy", ["autonomous", "guided", "deterministic"])
+async def test_caller_cancellation_propagates_for_each_strategy(
+    strategy: ExecutionStrategy,
+) -> None:
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    class WaitingModel:
+        async def chat(
+            self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+        ) -> ChatResult:
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+            return ChatResult(content="unreachable")
+
+    task = asyncio.create_task(
+        AgentRuntime(
+            WaitingModel(),
+            build_registry(),
+            Settings(execution_timeout=10, tool_timeout=1),
+        ).run(
+            "Check orders-api",
+            strategy=strategy,
+            workflow="service_health" if strategy == "deterministic" else None,
+        )
+    )
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cancelled.is_set()
 
 
 @pytest.mark.asyncio

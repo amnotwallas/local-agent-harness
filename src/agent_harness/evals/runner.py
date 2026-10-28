@@ -3,9 +3,10 @@ import asyncio
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from statistics import mean, median
 from typing import Any
 
-from agent_harness.agents.runtime import AgentResult, AgentRuntime
+from agent_harness.agents.runtime import AgentResult, AgentRuntime, ExecutionStrategy
 from agent_harness.config import Settings
 from agent_harness.evals.scenarios import Scenario, load_scenarios
 from agent_harness.models.client import ChatResult, OpenAIClient, ToolCall
@@ -13,14 +14,19 @@ from agent_harness.tools.registry import build_registry
 
 
 class ScenarioModel:
-    def __init__(self, scenario: Scenario) -> None:
+    def __init__(self, scenario: Scenario, strategy: ExecutionStrategy) -> None:
         self.scenario = scenario
+        self.strategy = strategy
         self.sent_tools = False
 
     async def chat(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
     ) -> ChatResult:
-        if not self.sent_tools and self.scenario.expected_tool_calls:
+        if (
+            self.strategy in {"autonomous", "guided"}
+            and not self.sent_tools
+            and self.scenario.expected_tool_calls
+        ):
             self.sent_tools = True
             calls = [
                 ToolCall(
@@ -40,6 +46,23 @@ def score_result(scenario: Scenario, result: AgentResult) -> dict[str, Any]:
     ]
     expected_calls = [call.model_dump() for call in scenario.expected_tool_calls]
     errors = sum(item.error is not None for item in result.tool_history)
+    evidence_results = [
+        any(
+            item.tool_name == call.name
+            and item.arguments == call.arguments
+            and item.error is None
+            and item.result is not None
+            for item in result.tool_history
+        )
+        for call in scenario.expected_tool_calls
+    ]
+    evidence_attempts = [
+        any(
+            item.tool_name == call.name and item.arguments == call.arguments
+            for item in result.tool_history
+        )
+        for call in scenario.expected_tool_calls
+    ]
     required_facts = {
         fact: "covered"
         if any(phrase.casefold() in answer.casefold() for phrase in equivalents)
@@ -87,6 +110,12 @@ def score_result(scenario: Scenario, result: AgentResult) -> dict[str, Any]:
         ],
         "required_facts": required_facts,
         "required_facts_present": all(value == "covered" for value in required_facts.values()),
+        "required_evidence_coverage": {
+            "covered": sum(evidence_results),
+            "attempted": sum(evidence_attempts),
+            "total": len(expected_calls),
+            "rate": sum(evidence_results) / len(expected_calls) if expected_calls else 1.0,
+        },
         "unsupported_claims": {claim: "unverified" for claim in scenario.unsupported_claims},
         "output_schema": "compliant" if schema_ok else "failed",
         "execution_errors": errors,
@@ -95,7 +124,10 @@ def score_result(scenario: Scenario, result: AgentResult) -> dict[str, Any]:
 
 
 async def evaluate(
-    mode: str = "mock", trials: int = 1, baseline: Path | None = None
+    mode: str = "mock",
+    trials: int = 1,
+    baseline: Path | None = None,
+    strategy: ExecutionStrategy = "autonomous",
 ) -> dict[str, Any]:
     settings = Settings.from_env()
     scenarios = load_scenarios()
@@ -104,7 +136,7 @@ async def evaluate(
     for scenario in scenarios:
         for trial in range(trials):
             if mode == "mock":
-                model: Any = ScenarioModel(scenario)
+                model: Any = ScenarioModel(scenario, strategy)
             else:
                 model = OpenAIClient(settings)
             runtime_settings = Settings(
@@ -116,7 +148,11 @@ async def evaluate(
             runtime = AgentRuntime(
                 model, build_registry(mock_responses=scenario.mock_tool_responses), runtime_settings
             )
-            result = await runtime.run(scenario.task)
+            result = await runtime.run(
+                scenario.task,
+                strategy=strategy,
+                workflow=(scenario.deterministic_workflow if strategy == "deterministic" else None),
+            )
             if isinstance(model, OpenAIClient):
                 resolved_model_id = model.model_id or resolved_model_id
                 await model.close()
@@ -137,6 +173,7 @@ async def evaluate(
             "mode": mode,
             "evaluation_scope": "harness_behavior" if mode == "mock" else "live_model_behavior",
             "tool_data_scope": "scenario_fixtures",
+            "strategy": strategy,
             "model": resolved_model_id,
             "dataset": "aiops-v1",
             "harness_version": "0.1.0",
@@ -144,6 +181,16 @@ async def evaluate(
                 "base_url": settings.llm_base_url,
                 "temperature": settings.temperature,
                 "tool_protocol": settings.tool_protocol,
+            },
+            "configuration": {
+                "max_iterations": settings.max_iterations,
+                "max_tool_calls": settings.max_tool_calls,
+                "execution_timeout": settings.execution_timeout,
+                "tool_timeout": settings.tool_timeout,
+                "llm_timeout": settings.llm_timeout,
+                "max_tokens": settings.max_tokens,
+                "temperature": settings.temperature,
+                "trials": trials,
             },
             "created_at": datetime.now(UTC).isoformat(),
             "trials": trials,
@@ -158,9 +205,22 @@ async def evaluate(
             "tool_selection_failures": sum(not row["tool_selection_accuracy"] for row in results),
             "evaluation_failures": sum(not row["evaluation_assertions_passed"] for row in results),
             "infrastructure_errors": sum(row["infrastructure_error"] for row in results),
+            "required_evidence_coverage": {
+                "covered": sum(row["required_evidence_coverage"]["covered"] for row in results),
+                "attempted": sum(row["required_evidence_coverage"]["attempted"] for row in results),
+                "total": sum(row["required_evidence_coverage"]["total"] for row in results),
+            },
+            "mean_tool_calls": mean(len(row["tool_calls"]) for row in results),
+            "mean_tool_errors": mean(row["execution_errors"] for row in results),
+            "mean_latency_ms": mean(row["latency_ms"] for row in results),
+            "median_latency_ms": median(row["latency_ms"] for row in results),
+            "mean_prompt_tokens": mean(row["prompt_tokens"] for row in results),
+            "mean_completion_tokens": mean(row["completion_tokens"] for row in results),
             "by_scenario": {},
         },
     }
+    evidence = report["summary"]["required_evidence_coverage"]
+    evidence["rate"] = evidence["covered"] / evidence["total"] if evidence["total"] else 1.0
     for scenario in scenarios:
         rows = [row for row in results if row["test_id"] == scenario.test_id]
         report["summary"]["by_scenario"][scenario.test_id] = {
@@ -169,6 +229,14 @@ async def evaluate(
             "tool_selection_passed": sum(row["tool_selection_accuracy"] for row in rows),
             "evaluation_failures": sum(not row["evaluation_assertions_passed"] for row in rows),
             "infrastructure_errors": sum(row["infrastructure_error"] for row in rows),
+            "required_evidence_coverage": {
+                "covered": sum(row["required_evidence_coverage"]["covered"] for row in rows),
+                "total": sum(row["required_evidence_coverage"]["total"] for row in rows),
+            },
+            "mean_tool_calls": mean(len(row["tool_calls"]) for row in rows),
+            "mean_latency_ms": mean(row["latency_ms"] for row in rows),
+            "mean_prompt_tokens": mean(row["prompt_tokens"] for row in rows),
+            "mean_completion_tokens": mean(row["completion_tokens"] for row in rows),
         }
     if baseline:
         previous = json.loads(baseline.read_text())
@@ -186,13 +254,16 @@ async def evaluate(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["mock", "live"], default="live")
+    parser.add_argument(
+        "--strategy", choices=["autonomous", "guided", "deterministic"], default="autonomous"
+    )
     parser.add_argument("--trials", type=int, default=1)
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--output", type=Path, default=Path("reports/latest.json"))
     args = parser.parse_args()
     if args.trials < 1:
         parser.error("--trials must be at least 1")
-    report = asyncio.run(evaluate(args.mode, args.trials, args.baseline))
+    report = asyncio.run(evaluate(args.mode, args.trials, args.baseline, strategy=args.strategy))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report["summary"], indent=2))

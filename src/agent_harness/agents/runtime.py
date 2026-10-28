@@ -7,11 +7,13 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 
+from agent_harness.agents.workflows import build_workflow_plan
 from agent_harness.config import Settings
 from agent_harness.models.client import ChatResult, ModelError, ToolCall
 from agent_harness.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
+ExecutionStrategy = Literal["autonomous", "guided", "deterministic"]
 
 
 class Model(Protocol):
@@ -47,6 +49,8 @@ class AgentResult(BaseModel):
     completion_tokens: int = 0
     model_duration_ms: float = 0.0
     termination_reason: str = ""
+    strategy: str = "autonomous"
+    workflow: str | None = None
 
 
 class AgentRuntime:
@@ -55,7 +59,13 @@ class AgentRuntime:
         self.registry = registry
         self.settings = settings
 
-    async def run(self, task: str, request_id: str | None = None) -> AgentResult:
+    async def run(
+        self,
+        task: str,
+        request_id: str | None = None,
+        strategy: ExecutionStrategy = "autonomous",
+        workflow: str | None = None,
+    ) -> AgentResult:
         started = perf_counter()
         deadline = started + self.settings.execution_timeout
         request_id = request_id or str(uuid4())
@@ -83,6 +93,22 @@ class AgentRuntime:
         model_duration_ms = 0.0
         tool_calls_executed = 0
         protocol = self.settings.tool_protocol
+        if strategy not in {"autonomous", "guided", "deterministic"}:
+            return self._result(
+                request_id,
+                execution_id,
+                "failed",
+                None,
+                history,
+                started,
+                model_calls,
+                prompt_tokens,
+                completion_tokens,
+                model_duration_ms,
+                "invalid_strategy",
+                strategy,
+                workflow,
+            )
         if protocol not in {"native", "json"}:
             return self._result(
                 request_id,
@@ -96,12 +122,64 @@ class AgentRuntime:
                 completion_tokens,
                 model_duration_ms,
                 "invalid_tool_protocol",
+                strategy,
+                workflow,
             )
         if protocol == "json":
             messages[0]["content"] += (
                 ' Return only JSON: {"tool_calls":[{"id":string,"name":string,"arguments":object}]}'
                 ' or {"final":string}. Do not use other tools. Allowed schemas: '
                 + json.dumps(self.registry.schemas())
+            )
+
+        if strategy != "autonomous":
+            if strategy == "deterministic" and not workflow:
+                return self._result(
+                    request_id,
+                    execution_id,
+                    "failed",
+                    None,
+                    history,
+                    started,
+                    model_calls,
+                    prompt_tokens,
+                    completion_tokens,
+                    model_duration_ms,
+                    "missing_workflow",
+                    strategy,
+                    workflow,
+                )
+            if strategy == "guided" and workflow is not None:
+                return self._result(
+                    request_id,
+                    execution_id,
+                    "failed",
+                    None,
+                    history,
+                    started,
+                    model_calls,
+                    prompt_tokens,
+                    completion_tokens,
+                    model_duration_ms,
+                    "workflow_only_valid_for_deterministic_strategy",
+                    strategy,
+                    workflow,
+                )
+            return await self._run_planned(
+                task,
+                strategy,
+                workflow,
+                messages,
+                protocol,
+                started,
+                deadline,
+                request_id,
+                execution_id,
+                history,
+                model_calls,
+                prompt_tokens,
+                completion_tokens,
+                model_duration_ms,
             )
 
         for _ in range(self.settings.max_iterations):
@@ -166,11 +244,15 @@ class AgentRuntime:
                         model_duration_ms,
                         "final_response",
                     )
-                if tool_calls_executed + len(calls) > self.settings.max_tool_calls:
+                tool_messages, execution_status = await self._execute_tool_calls(
+                    calls, history, deadline, request_id, execution_id, tool_calls_executed
+                )
+                if execution_status is not None:
+                    is_limit = execution_status == "tool_call_limit_reached"
                     return self._result(
                         request_id,
                         execution_id,
-                        "tool_call_limit_reached",
+                        "tool_call_limit_reached" if is_limit else "deadline_exceeded",
                         None,
                         history,
                         started,
@@ -178,103 +260,11 @@ class AgentRuntime:
                         prompt_tokens,
                         completion_tokens,
                         model_duration_ms,
-                        "max_tool_calls_reached",
+                        "max_tool_calls_reached" if is_limit else "execution_deadline",
+                        strategy,
+                        workflow,
                     )
-                assistant_calls = [
-                    {
-                        "id": call.id,
-                        "type": "function",
-                        "function": {
-                            "name": call.name,
-                            "arguments": json.dumps(call.arguments),
-                        },
-                    }
-                    for call in calls
-                ]
-                tool_messages: list[dict[str, Any]] = []
-                for call in calls:
-                    call_started = perf_counter()
-                    arguments_valid = False
-                    remaining = deadline - perf_counter()
-                    if remaining <= 0:
-                        return self._result(
-                            request_id,
-                            execution_id,
-                            "deadline_exceeded",
-                            None,
-                            history,
-                            started,
-                            model_calls,
-                            prompt_tokens,
-                            completion_tokens,
-                            model_duration_ms,
-                            "execution_deadline",
-                        )
-                    try:
-                        self.registry.validate(call.name, call.arguments)
-                        arguments_valid = True
-                        result = await asyncio.wait_for(
-                            self.registry.call(call.name, call.arguments),
-                            timeout=min(self.settings.tool_timeout, remaining),
-                        )
-                        serialized = (
-                            result.model_dump(mode="json")
-                            if hasattr(result, "model_dump")
-                            else [item.model_dump(mode="json") for item in result]
-                            if isinstance(result, list)
-                            else result
-                        )
-                        execution = ToolExecution(
-                            tool_name=call.name,
-                            arguments=call.arguments,
-                            result=serialized,
-                            arguments_valid=arguments_valid,
-                        )
-                    except Exception as exc:
-                        execution = ToolExecution(
-                            tool_name=call.name,
-                            arguments=call.arguments,
-                            error="Tool execution failed",
-                            arguments_valid=arguments_valid,
-                        )
-                        logger.warning(
-                            "tool failed request_id=%s execution_id=%s tool=%s error=%s",
-                            request_id,
-                            execution_id,
-                            call.name,
-                            type(exc).__name__,
-                        )
-                    execution.duration_ms = (perf_counter() - call_started) * 1000
-                    history.append(execution)
-                    tool_calls_executed += 1
-                    tool_messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call.id,
-                            "content": json.dumps(
-                                execution.result
-                                if execution.error is None
-                                else {"error": execution.error}
-                            ),
-                        }
-                    )
-                    if perf_counter() >= deadline:
-                        return self._result(
-                            request_id,
-                            execution_id,
-                            "deadline_exceeded",
-                            None,
-                            history,
-                            started,
-                            model_calls,
-                            prompt_tokens,
-                            completion_tokens,
-                            model_duration_ms,
-                            "execution_deadline",
-                        )
-                messages.append(
-                    {"role": "assistant", "content": None, "tool_calls": assistant_calls}
-                )
+                tool_calls_executed += len(calls)
                 messages.extend(tool_messages)
             except TimeoutError:
                 return self._result(
@@ -303,6 +293,8 @@ class AgentRuntime:
                     completion_tokens,
                     model_duration_ms,
                     "model_or_protocol_error",
+                    strategy,
+                    workflow,
                 )
         return self._result(
             request_id,
@@ -316,7 +308,302 @@ class AgentRuntime:
             completion_tokens,
             model_duration_ms,
             "max_iterations_reached",
+            strategy,
+            workflow,
         )
+
+    async def _run_planned(
+        self,
+        task: str,
+        strategy: ExecutionStrategy,
+        workflow: str | None,
+        messages: list[dict[str, Any]],
+        protocol: str,
+        started: float,
+        deadline: float,
+        request_id: str,
+        execution_id: str,
+        history: list[ToolExecution],
+        model_calls: int,
+        prompt_tokens: int,
+        completion_tokens: int,
+        model_duration_ms: float,
+    ) -> AgentResult:
+        try:
+            if strategy == "guided":
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Before answering, propose the complete ordered plan of relevant "
+                            "read-only tool calls. Return tool calls only; do not answer yet."
+                        ),
+                    }
+                )
+                remaining = deadline - perf_counter()
+                if remaining <= 0:
+                    return self._result(
+                        request_id,
+                        execution_id,
+                        "deadline_exceeded",
+                        None,
+                        history,
+                        started,
+                        model_calls,
+                        prompt_tokens,
+                        completion_tokens,
+                        model_duration_ms,
+                        "execution_deadline",
+                        strategy,
+                        workflow,
+                    )
+                model_calls += 1
+                response = await asyncio.wait_for(
+                    self.model.chat(
+                        messages,
+                        self.registry.schemas() if protocol == "native" else None,
+                    ),
+                    timeout=remaining,
+                )
+                prompt_tokens += response.prompt_tokens or 0
+                completion_tokens += response.completion_tokens or 0
+                model_duration_ms += response.duration_ms
+                calls = (
+                    response.tool_calls
+                    if protocol == "native"
+                    else self._json_calls(response.content)
+                )
+                if not calls and response.content:
+                    raise ValueError("Guided strategy must return a tool-call plan")
+            else:
+                try:
+                    calls = build_workflow_plan(workflow or "", task)
+                except ValueError as exc:
+                    reason = (
+                        "unknown_workflow" if "Unknown" in str(exc) else "invalid_workflow_input"
+                    )
+                    return self._result(
+                        request_id,
+                        execution_id,
+                        "failed",
+                        None,
+                        history,
+                        started,
+                        model_calls,
+                        prompt_tokens,
+                        completion_tokens,
+                        model_duration_ms,
+                        reason,
+                        strategy,
+                        workflow,
+                    )
+
+            if len(calls) > self.settings.max_tool_calls:
+                return self._result(
+                    request_id,
+                    execution_id,
+                    "tool_call_limit_reached",
+                    None,
+                    history,
+                    started,
+                    model_calls,
+                    prompt_tokens,
+                    completion_tokens,
+                    model_duration_ms,
+                    "max_tool_calls_reached",
+                    strategy,
+                    workflow,
+                )
+            if len({call.id for call in calls}) != len(calls):
+                raise ValueError("Tool call IDs must be unique")
+            for call in calls:
+                self.registry.validate(call.name, call.arguments)
+            remaining = deadline - perf_counter()
+            if len(calls) * self.settings.tool_timeout > remaining:
+                return self._result(
+                    request_id,
+                    execution_id,
+                    "deadline_exceeded",
+                    None,
+                    history,
+                    started,
+                    model_calls,
+                    prompt_tokens,
+                    completion_tokens,
+                    model_duration_ms,
+                    "plan_exceeds_time_budget",
+                    strategy,
+                    workflow,
+                )
+            tool_messages, execution_status = await self._execute_tool_calls(
+                calls, history, deadline, request_id, execution_id, 0
+            )
+            if execution_status is not None:
+                is_limit = execution_status == "tool_call_limit_reached"
+                return self._result(
+                    request_id,
+                    execution_id,
+                    "tool_call_limit_reached" if is_limit else "deadline_exceeded",
+                    None,
+                    history,
+                    started,
+                    model_calls,
+                    prompt_tokens,
+                    completion_tokens,
+                    model_duration_ms,
+                    "max_tool_calls_reached" if is_limit else "execution_deadline",
+                    strategy,
+                    workflow,
+                )
+            messages.extend(tool_messages)
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Summarize the results of the completed investigation. Use only the "
+                        "evidence above, describe missing or failed evidence, and state "
+                        "uncertainty."
+                    ),
+                }
+            )
+            remaining = deadline - perf_counter()
+            if remaining <= 0:
+                raise TimeoutError
+            model_calls += 1
+            summary = await asyncio.wait_for(self.model.chat(messages, None), timeout=remaining)
+            prompt_tokens += summary.prompt_tokens or 0
+            completion_tokens += summary.completion_tokens or 0
+            model_duration_ms += summary.duration_ms
+            final = summary.content if protocol == "native" else self._json_final(summary.content)
+            if not isinstance(final, str) or not final.strip():
+                raise ValueError("Model returned no final response")
+            return self._result(
+                request_id,
+                execution_id,
+                "completed",
+                final,
+                history,
+                started,
+                model_calls,
+                prompt_tokens,
+                completion_tokens,
+                model_duration_ms,
+                "final_response",
+                strategy,
+                workflow,
+            )
+        except TimeoutError:
+            return self._result(
+                request_id,
+                execution_id,
+                "deadline_exceeded",
+                None,
+                history,
+                started,
+                model_calls,
+                prompt_tokens,
+                completion_tokens,
+                model_duration_ms,
+                "execution_deadline",
+                strategy,
+                workflow,
+            )
+        except (ModelError, ValueError, TypeError, json.JSONDecodeError):
+            return self._result(
+                request_id,
+                execution_id,
+                "failed",
+                None,
+                history,
+                started,
+                model_calls,
+                prompt_tokens,
+                completion_tokens,
+                model_duration_ms,
+                "invalid_tool_plan" if strategy == "guided" else "model_or_protocol_error",
+                strategy,
+                workflow,
+            )
+
+    async def _execute_tool_calls(
+        self,
+        calls: list[ToolCall],
+        history: list[ToolExecution],
+        deadline: float,
+        request_id: str,
+        execution_id: str,
+        tool_calls_executed: int,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        if not calls:
+            return [], None
+        if tool_calls_executed + len(calls) > self.settings.max_tool_calls:
+            return [], "tool_call_limit_reached"
+        assistant_calls = [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {"name": call.name, "arguments": json.dumps(call.arguments)},
+            }
+            for call in calls
+        ]
+        tool_messages: list[dict[str, Any]] = []
+        for call in calls:
+            call_started = perf_counter()
+            arguments_valid = False
+            remaining = deadline - perf_counter()
+            if remaining <= 0:
+                return [], "deadline_exceeded"
+            try:
+                self.registry.validate(call.name, call.arguments)
+                arguments_valid = True
+                result = await asyncio.wait_for(
+                    self.registry.call(call.name, call.arguments),
+                    timeout=min(self.settings.tool_timeout, remaining),
+                )
+                serialized = (
+                    result.model_dump(mode="json")
+                    if hasattr(result, "model_dump")
+                    else [item.model_dump(mode="json") for item in result]
+                    if isinstance(result, list)
+                    else result
+                )
+                execution = ToolExecution(
+                    tool_name=call.name,
+                    arguments=call.arguments,
+                    result=serialized,
+                    arguments_valid=arguments_valid,
+                )
+            except Exception as exc:
+                execution = ToolExecution(
+                    tool_name=call.name,
+                    arguments=call.arguments,
+                    error="Tool execution failed",
+                    arguments_valid=arguments_valid,
+                )
+                logger.warning(
+                    "tool failed request_id=%s execution_id=%s tool=%s error=%s",
+                    request_id,
+                    execution_id,
+                    call.name,
+                    type(exc).__name__,
+                )
+            execution.duration_ms = (perf_counter() - call_started) * 1000
+            history.append(execution)
+            tool_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": json.dumps(
+                        execution.result if execution.error is None else {"error": execution.error}
+                    ),
+                }
+            )
+            if perf_counter() >= deadline:
+                return [], "deadline_exceeded"
+        return [
+            {"role": "assistant", "content": None, "tool_calls": assistant_calls},
+            *tool_messages,
+        ], None
 
     def _json_calls(self, content: str | None) -> list[ToolCall]:
         if not content:
@@ -359,6 +646,8 @@ class AgentRuntime:
         completion_tokens: int,
         model_duration_ms: float,
         reason: str,
+        strategy: str = "autonomous",
+        workflow: str | None = None,
     ) -> AgentResult:
         return AgentResult(
             request_id=request_id,
@@ -372,4 +661,6 @@ class AgentRuntime:
             completion_tokens=completion_tokens,
             model_duration_ms=model_duration_ms,
             termination_reason=reason,
+            strategy=strategy,
+            workflow=workflow,
         )

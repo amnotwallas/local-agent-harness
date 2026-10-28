@@ -1,5 +1,9 @@
 .PHONY: help setup dev lint format format-check typecheck test eval eval-mock check
 
+STRATEGY ?= autonomous
+TRIALS ?= 1
+OUTPUT ?= reports/latest.json
+
 help:
 	@grep -E '^[a-zA-Z_-]+:.*##' $(MAKEFILE_LIST) | sed 's/:.*## / - /'
 
@@ -25,9 +29,9 @@ test: ## Run deterministic tests
 	uv run --locked --offline pytest
 
 eval: ## Run live model evaluations
-	uv run --locked --offline python -m agent_harness.evals.runner --mode live
+	uv run --locked --offline python -m agent_harness.evals.runner --mode live --strategy $(STRATEGY) --trials $(TRIALS) --output $(OUTPUT)
 
 eval-mock: ## Run deterministic mocked evaluations
-	uv run --locked --offline python -m agent_harness.evals.runner --mode mock
+	uv run --locked --offline python -m agent_harness.evals.runner --mode mock --strategy $(STRATEGY) --trials $(TRIALS) --output $(OUTPUT)
 
 check: lint format-check typecheck test ## Run all offline quality checks

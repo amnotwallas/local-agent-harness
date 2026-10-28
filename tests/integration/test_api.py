@@ -6,7 +6,7 @@ from httpx import ASGITransport, AsyncClient
 
 from agent_harness.api.app import create_app
 from agent_harness.config import Settings
-from agent_harness.models.client import ChatResult
+from agent_harness.models.client import ChatResult, ToolCall
 
 
 class FinalModel:
@@ -44,6 +44,59 @@ async def test_agent_run_rejects_tool_outside_allowlist() -> None:
         )
     assert response.status_code == 422
     assert response.json()["error"] == "Requested tool is not available"
+
+
+@pytest.mark.asyncio
+async def test_deterministic_strategy_requires_and_uses_named_workflow() -> None:
+    app = create_app(settings=Settings(), model=FinalModel())
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        missing = await client.post(
+            "/agents/run", json={"task": "Check orders-api", "strategy": "deterministic"}
+        )
+        response = await client.post(
+            "/agents/run",
+            json={
+                "task": "Check orders-api health",
+                "strategy": "deterministic",
+                "workflow": "service_health",
+            },
+        )
+
+    assert missing.status_code == 422
+    assert response.status_code == 200
+    assert response.json()["tool_history"][0]["tool_name"] == "get_service_health"
+    assert response.json()["strategy"] == "deterministic"
+
+
+@pytest.mark.asyncio
+async def test_guided_strategy_is_selectable_through_api() -> None:
+    class GuidedModel:
+        async def chat(
+            self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+        ) -> ChatResult:
+            if tools is not None:
+                return ChatResult(
+                    tool_calls=[
+                        ToolCall(
+                            id="health",
+                            name="get_service_health",
+                            arguments={"service_name": "orders-api"},
+                        )
+                    ]
+                )
+            return ChatResult(content="Orders-api health checked.")
+
+    async with AsyncClient(
+        transport=ASGITransport(app=create_app(settings=Settings(), model=GuidedModel())),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/agents/run", json={"task": "Check orders-api", "strategy": "guided"}
+        )
+
+    assert response.status_code == 200
+    assert response.json()["strategy"] == "guided"
+    assert response.json()["tool_history"][0]["tool_name"] == "get_service_health"
 
 
 @pytest.mark.asyncio

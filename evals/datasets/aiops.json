@@ -60,7 +60,8 @@
     },
     "expected_tool_errors": 0,
     "allowed_tool_calls": [],
-    "forbidden_tool_calls": []
+    "forbidden_tool_calls": [],
+    "deterministic_workflow": "service_health"
   },
   {
     "test_id": "payment-latency-spike",
@@ -151,7 +152,8 @@
     },
     "expected_tool_errors": 0,
     "allowed_tool_calls": [],
-    "forbidden_tool_calls": []
+    "forbidden_tool_calls": [],
+    "deterministic_workflow": "service_diagnosis"
   },
   {
     "test_id": "elevated-http-errors",
@@ -221,7 +223,8 @@
         }
       }
     ],
-    "forbidden_tool_calls": []
+    "forbidden_tool_calls": [],
+    "deterministic_workflow": "service_health"
   },
   {
     "test_id": "database-exhaustion",
@@ -309,7 +312,8 @@
     },
     "expected_tool_errors": 0,
     "allowed_tool_calls": [],
-    "forbidden_tool_calls": []
+    "forbidden_tool_calls": [],
+    "deterministic_workflow": "service_diagnosis"
   },
   {
     "test_id": "deployment-incident",
@@ -381,7 +385,8 @@
     },
     "expected_tool_errors": 0,
     "allowed_tool_calls": [],
-    "forbidden_tool_calls": []
+    "forbidden_tool_calls": [],
+    "deterministic_workflow": "incident_summary"
   },
   {
     "test_id": "conflicting-telemetry",
@@ -467,7 +472,8 @@
     },
     "expected_tool_errors": 0,
     "allowed_tool_calls": [],
-    "forbidden_tool_calls": []
+    "forbidden_tool_calls": [],
+    "deterministic_workflow": "compare_services"
   },
   {
     "test_id": "missing-evidence",
@@ -513,7 +519,8 @@
     "mock_tool_responses": {},
     "expected_tool_errors": 1,
     "allowed_tool_calls": [],
-    "forbidden_tool_calls": []
+    "forbidden_tool_calls": [],
+    "deterministic_workflow": "service_health"
   },
   {
     "test_id": "incomplete-logs",
@@ -573,7 +580,8 @@
     },
     "expected_tool_errors": 0,
     "allowed_tool_calls": [],
-    "forbidden_tool_calls": []
+    "forbidden_tool_calls": [],
+    "deterministic_workflow": "recent_error_logs"
   },
   {
     "test_id": "tool-failure",
@@ -625,7 +633,8 @@
         }
       }
     ],
-    "forbidden_tool_calls": []
+    "forbidden_tool_calls": [],
+    "deterministic_workflow": "service_health"
   },
   {
     "test_id": "ambiguous-cause",
@@ -744,6 +753,7 @@
         }
       }
     ],
-    "forbidden_tool_calls": []
+    "forbidden_tool_calls": [],
+    "deterministic_workflow": "incident_cause_review"
   }
 ]

@@ -1,7 +1,7 @@
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from agent_harness.agents.runtime import AgentResult, AgentRuntime
+from agent_harness.agents.workflows import WORKFLOW_NAMES
 from agent_harness.config import Settings
 from agent_harness.models.client import OpenAIClient
 from agent_harness.tools.registry import build_registry
@@ -20,6 +21,8 @@ logger = logging.getLogger(__name__)
 class RunRequest(BaseModel):
     task: str = Field(min_length=1, max_length=8000)
     allowed_tools: list[str] | None = None
+    strategy: Literal["autonomous", "guided", "deterministic"] = "autonomous"
+    workflow: str | None = None
 
 
 class ErrorResponse(BaseModel):
@@ -77,6 +80,22 @@ def create_app(settings: Settings | None = None, model: Any | None = None) -> Fa
         },
     )
     async def run_agent(body: RunRequest, request: Request) -> Any:
+        if body.strategy == "deterministic" and body.workflow not in WORKFLOW_NAMES:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": "Deterministic strategy requires a valid workflow",
+                    "request_id": request.headers.get("x-request-id"),
+                },
+            )
+        if body.strategy != "deterministic" and body.workflow is not None:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": "Workflow is only valid for the deterministic strategy",
+                    "request_id": request.headers.get("x-request-id"),
+                },
+            )
         if body.allowed_tools is not None and not set(body.allowed_tools) <= set(registry.names):
             return JSONResponse(
                 status_code=422,
@@ -89,7 +108,10 @@ def create_app(settings: Settings | None = None, model: Any | None = None) -> Fa
             registry.subset(set(body.allowed_tools)) if body.allowed_tools is not None else registry
         )
         result = await AgentRuntime(client, run_registry, config).run(
-            body.task, request.headers.get("x-request-id")
+            body.task,
+            request.headers.get("x-request-id"),
+            strategy=body.strategy,
+            workflow=body.workflow,
         )
         if result.status == "deadline_exceeded":
             return JSONResponse(status_code=504, content=result.model_dump(mode="json"))

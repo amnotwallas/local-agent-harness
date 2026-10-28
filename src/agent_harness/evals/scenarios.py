@@ -16,6 +16,7 @@ class Scenario(BaseModel):
     test_id: str
     category: str
     task: str
+    deterministic_workflow: str | None = None
     expected_tool_calls: list[ExpectedCall]
     allowed_tool_calls: list[ExpectedCall] = Field(default_factory=list)
     forbidden_tool_calls: list[ExpectedCall] = Field(default_factory=list)

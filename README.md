@@ -1,29 +1,68 @@
-# Agent Harness
+# Local Agent Harness
 
-A small local FastAPI harness for AIOps experiments with llama.cpp's OpenAI-compatible API. It runs deterministic, read-only health, log, and incident tools; it does not run shell commands, make arbitrary HTTP requests, or modify files.
+A local FastAPI sandbox for experimenting with AIOps agents backed by a llama.cpp server. The agent can inspect service health, recent logs, and incident details through bounded, read-only tools.
 
-## Setup
+> The included tools return deterministic sample data from the code. They do not connect to real monitoring, logging, or incident systems. Live evaluations use the configured model, but still use the sample tool data.
 
-Requires Python 3.12+ and uv.
+## What it includes
+
+- Three orchestration strategies: autonomous, guided, and deterministic.
+- Free-text and structured incident report outputs.
+- Tool allowlisting, validated inputs, and limits on execution time and tool calls.
+- Mock and live evaluation modes.
+
+```mermaid
+flowchart LR
+    Client --> API[FastAPI]
+    API --> Agent[Agent runtime]
+    Agent --> Model[llama.cpp API]
+    Agent --> Tools[Read-only sample tools]
+```
+
+## Quick start
+
+Requires Python 3.12+, [uv](https://docs.astral.sh/uv/), and a running llama.cpp server with an OpenAI-compatible API.
 
 ```sh
 make setup
 cp .env.example .env
-# Adjust .env as needed, load it into the shell, then start the API.
+# Set LLM_BASE_URL in .env to your llama.cpp server.
 set -a; source .env; set +a
 make dev
 ```
 
-The API binds to `127.0.0.1:8000`. Endpoints are `GET /health`, `GET /tools`, and `POST /agents/run` with `{"task":"...", "allowed_tools":[...]}`. Optional `strategy` and `output_mode` fields select an orchestration strategy and final response format; defaults remain `autonomous` and `free_text`. JSON report modes request a Pydantic-validated incident report separating observations, hypotheses, missing evidence, and tool failures; invalid reports remain visible as raw output with failed format compliance. The run response and error shapes are published in OpenAPI. If `LLM_MODEL` is unset, the client discovers an ID from `/v1/models`. Default inference uses temperature 0, a 120 second request timeout, and the llama.cpp `chat_template_kwargs.enable_thinking=false` setting. `AGENT_EXECUTION_TIMEOUT` bounds the complete run (default 300 seconds), and `AGENT_MAX_TOOL_CALLS` caps tools across all iterations (default 10). `TOOL_PROTOCOL=native` uses OpenAI tool calls. Set `TOOL_PROTOCOL=json` explicitly to use the JSON tool-call protocol; this is separate from the final `output_mode`.
+The API listens on `http://127.0.0.1:8000`. For configuration and request options, see [Usage](docs/usage.md).
 
-## Development
+## Try a request
 
-Use Makefile targets for setup, dev, lint, format, format-check, typecheck, test, and check. `make check` is offline and does not contact the inference server. Dependencies are declared in `pyproject.toml` and pinned in `uv.lock`.
+```sh
+curl http://127.0.0.1:8000/agents/run \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "task": "Check payments-api and summarize its recent errors",
+    "allowed_tools": ["get_service_health", "get_recent_logs"]
+  }'
+```
+
+## API
+
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| `GET` | `/health` | Check that the API is running |
+| `GET` | `/tools` | List available tools and their schemas |
+| `POST` | `/agents/run` | Run an agent task |
+
+Interactive API docs are available at [`/docs`](http://127.0.0.1:8000/docs) while the server is running.
 
 ## Evaluations
 
-`make eval-mock` runs the shared runtime against the versioned 10-scenario fixture dataset with deterministic model transcripts and mocked tool data. It validates harness behavior; it does not measure model tool selection. Both modes score task success using exact expected calls, valid arguments, required fact presence, response schema, execution status, and expected tool errors. Required fact presence is coverage, not proof of truth. Unsupported semantic claims remain `unverified` and do not get guessed by keyword matching.
+```sh
+make eval-mock
+make eval STRATEGY=guided OUTPUT_MODE=prompt_json TRIALS=3
+```
 
-`make eval` runs the same scenarios through the configured model. Select conditions with `make eval STRATEGY=guided OUTPUT_MODE=prompt_json TRIALS=3 OUTPUT=reports/guided-prompt-json.json`; `OUTPUT_MODE` can be `free_text`, `prompt_json`, or `schema_json`. Schema mode sends llama.cpp's `json_object` schema format and records HTTP acceptance separately from Pydantic compliance. Both eval targets write JSON reports (ignored by Git). For a baseline comparison, run `uv run --locked python -m agent_harness.evals.runner --mode live --trials 3 --baseline reports/baseline.json`.
+Mock evaluations validate harness behavior with fixed transcripts and sample data. Live evaluations call the configured model. See [Evaluations](docs/evaluations.md) for metrics, options, and limitations.
 
-The live Qwen3-4B model and server are external dependencies. Native tool calling depends on the model's chat template; inspect live evaluation results before relying on it. The report labels mock and live evaluation scope separately. If native calling fails consistently, explicitly configure the JSON fallback and rerun.
+## Development
+
+Run `make check` for linting, formatting, type checks, and tests. See [Usage](docs/usage.md) for setup details and [Evaluations](docs/evaluations.md) for evaluation commands.

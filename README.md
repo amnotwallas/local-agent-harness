@@ -63,6 +63,8 @@ make eval STRATEGY=guided OUTPUT_MODE=prompt_json TRIALS=3
 
 Mock evaluations validate harness behavior with fixed transcripts and sample data. Live evaluations call the configured model. See [Evaluations](docs/evaluations.md) for metrics, options, and limitations.
 
+> **Interpreting results:** Mock runs check harness behavior with scripted model responses and sample tool data; they do not measure model quality or tool selection. Live runs use the configured model but still rely on sample tool data. Scores track scenario criteria and output format, not factual correctness: required-fact coverage means a phrase was present, not that the claim is true or supported. Treat results as diagnostics for this setup, not as a model benchmark or evidence of production readiness. Deterministic results come from predefined workflows and are not directly comparable to model-driven strategies for tool-selection quality.
+
 ## Development
 
 Run `make check` for linting, formatting, type checks, and tests. See [Usage](docs/usage.md) for setup details and [Evaluations](docs/evaluations.md) for evaluation commands.

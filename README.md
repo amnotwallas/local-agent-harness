@@ -4,6 +4,12 @@ A local FastAPI sandbox for experimenting with AIOps agents backed by a llama.cp
 
 > The included tools return deterministic sample data from the code. They do not connect to real monitoring, logging, or incident systems. Live evaluations use the configured model, but still use the sample tool data.
 
+## Why this project exists
+
+This project is a learning and experimentation harness for building local AIOps agents. It lets you see how an agent turns an operational question into tool calls, uses the returned evidence, and produces a diagnosis, while keeping the tools read-only and bounded.
+
+It is useful if you want to explore agent orchestration, tool selection, structured responses, or compare strategies against a repeatable set of scenarios. It is not a monitoring product: the service, log, and incident data are fixtures, so it cannot diagnose your actual infrastructure or demonstrate production readiness.
+
 ## What it includes
 
 - Three orchestration strategies: autonomous, guided, and deterministic.
@@ -59,7 +65,7 @@ make eval-mock
 make eval STRATEGY=guided OUTPUT_MODE=prompt_json TRIALS=3
 ```
 
-Mock evaluations validate harness behavior offline with fixed transcripts and sample data. For live evaluations, start `make dev` first; `make eval` sends each scenario to that API. Both commands print a compact summary and save the full JSON report. See [Evaluations](docs/evaluations.md) for metrics, options, and limitations.
+Mock evaluations validate harness behavior offline with fixed transcripts and sample data. For live evaluations, start `make dev` first; `make eval` sends each scenario to that API. Both commands print a compact summary and save the full JSON report. See [Evaluations](docs/evaluations.md) for a sample output, how to interpret it, metrics, options, and limitations.
 
 > **Interpreting results:** Mock runs check harness behavior with scripted model responses and sample tool data; they do not measure model quality or tool selection. Live runs use the configured model but still rely on sample tool data. Scores track scenario criteria and output format, not factual correctness: required-fact coverage means a phrase was present, not that the claim is true or supported. Treat results as diagnostics for this setup, not as a model benchmark or evidence of production readiness. Deterministic results come from predefined workflows and are not directly comparable to model-driven strategies for tool-selection quality.
 

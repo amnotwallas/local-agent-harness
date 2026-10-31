@@ -26,8 +26,6 @@ Requires Python 3.12+, [uv](https://docs.astral.sh/uv/), and a running llama.cpp
 ```sh
 make setup
 cp .env.example .env
-# Set LLM_BASE_URL in .env to your llama.cpp server.
-set -a; source .env; set +a
 make dev
 ```
 

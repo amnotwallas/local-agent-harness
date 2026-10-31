@@ -2,7 +2,7 @@
 
 ## Configuration
 
-Copy `.env.example` to `.env` and set `LLM_BASE_URL` to the `/v1` endpoint of your llama.cpp server. If `LLM_MODEL` is unset, the client discovers an available model from `/v1/models`.
+Copy `.env.example` to `.env` and set `LLM_BASE_URL` to the `/v1` endpoint of your llama.cpp server. The harness loads `.env` automatically from the working directory; exported environment variables take precedence. If `LLM_MODEL` is unset, the client discovers an available model from `/v1/models`.
 
 | Variable | Default | Description |
 | --- | --- | --- |

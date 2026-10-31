@@ -1,6 +1,8 @@
 import os
 from dataclasses import dataclass
 
+from dotenv import load_dotenv
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -31,6 +33,7 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
+        load_dotenv(dotenv_path=".env", override=False)
         return cls(
             llm_base_url=os.getenv("LLM_BASE_URL", cls.llm_base_url),
             llm_timeout=float(os.getenv("LLM_TIMEOUT", str(cls.llm_timeout))),

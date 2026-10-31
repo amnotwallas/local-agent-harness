@@ -1,16 +1,24 @@
 import argparse
 import asyncio
 import json
+import os
+from contextlib import AsyncExitStack
 from datetime import UTC, datetime
 from pathlib import Path
 from statistics import mean, median
+from time import perf_counter
 from typing import Any
+
+import httpx
+from dotenv import load_dotenv
 
 from agent_harness.agents.incident_report import EvidenceStatement, IncidentReport
 from agent_harness.agents.runtime import AgentResult, AgentRuntime, ExecutionStrategy, OutputMode
 from agent_harness.config import Settings
+from agent_harness.evals.reporting import render_summary
 from agent_harness.evals.scenarios import Scenario, load_scenarios
-from agent_harness.models.client import ChatResult, OpenAIClient, ToolCall
+from agent_harness.logging_config import configure_logging
+from agent_harness.models.client import ChatResult, ToolCall
 from agent_harness.tools.registry import build_registry
 
 
@@ -59,7 +67,39 @@ class ScenarioModel:
         return ChatResult(content=json.dumps({"final": answer}) if tools is None else answer)
 
 
-def score_result(scenario: Scenario, result: AgentResult) -> dict[str, Any]:
+class EvaluationAPIError(RuntimeError):
+    pass
+
+
+# Settings caps server execution at 3600 seconds; leave room for HTTP overhead.
+API_RUN_TIMEOUT_SECONDS = 3610
+
+
+def _api_failure_result(
+    reason: str,
+    strategy: ExecutionStrategy,
+    workflow: str | None,
+    output_mode: OutputMode,
+    request_id: str = "api-error",
+) -> AgentResult:
+    return AgentResult(
+        request_id=request_id,
+        execution_id="api-error",
+        status="failed",
+        final_answer=None,
+        tool_history=[],
+        total_execution_time_ms=0,
+        model_calls=0,
+        termination_reason=reason,
+        strategy=strategy,
+        workflow=workflow,
+        output_mode=output_mode,
+    )
+
+
+def score_result(
+    scenario: Scenario, result: AgentResult, response_fields: set[str] | None = None
+) -> dict[str, Any]:
     answer = result.final_answer or ""
     actual_calls = [
         {"name": item.tool_name, "arguments": item.arguments} for item in result.tool_history
@@ -91,8 +131,8 @@ def score_result(scenario: Scenario, result: AgentResult) -> dict[str, Any]:
     }
     try:
         typed_result = AgentResult.model_validate(dict(result.__dict__))
-        response_fields = set(typed_result.model_dump())
-        schema_ok = all(key in response_fields for key in scenario.expected_output_structure)
+        fields = response_fields if response_fields is not None else set(typed_result.model_dump())
+        schema_ok = all(key in fields for key in scenario.expected_output_structure)
     except Exception:
         schema_ok = False
     allowed_calls = [call.model_dump() for call in scenario.allowed_tool_calls]
@@ -172,6 +212,7 @@ def score_result(scenario: Scenario, result: AgentResult) -> dict[str, Any]:
             "count": sum(value == "matched" for value in unsupported_matches.values()),
         },
         "execution_errors": errors,
+        "expected_tool_errors": scenario.expected_tool_errors,
         "task_success": task_success,
     }
 
@@ -182,89 +223,202 @@ async def evaluate(
     baseline: Path | None = None,
     strategy: ExecutionStrategy = "autonomous",
     output_mode: OutputMode = "free_text",
+    api_client: httpx.AsyncClient | None = None,
+    api_base_url: str | None = None,
 ) -> dict[str, Any]:
-    settings = Settings.from_env()
+    load_dotenv(dotenv_path=".env", override=False)
+    settings = Settings.from_env() if mode == "mock" else Settings()
     scenarios = load_scenarios()
     results: list[dict[str, Any]] = []
-    resolved_model_id = settings.model
-    for scenario in scenarios:
-        for trial in range(trials):
-            if mode == "mock":
-                model: Any = ScenarioModel(scenario, strategy, output_mode)
+    observed_models: set[str] = set()
+    api_url = api_base_url or os.getenv("API_BASE_URL") or "http://127.0.0.1:8000"
+    async with AsyncExitStack() as stack:
+        if mode == "live":
+            if api_client is None:
+                client = await stack.enter_async_context(
+                    httpx.AsyncClient(
+                        base_url=api_url,
+                        timeout=5,
+                    )
+                )
             else:
-                model = OpenAIClient(settings)
-            runtime_settings = Settings(
-                **{
-                    **settings.__dict__,
-                    "max_iterations": min(settings.max_iterations, scenario.max_tool_iterations),
-                }
-            )
-            runtime = AgentRuntime(
-                model, build_registry(mock_responses=scenario.mock_tool_responses), runtime_settings
-            )
-            result = await runtime.run(
-                scenario.task,
-                strategy=strategy,
-                workflow=(scenario.deterministic_workflow if strategy == "deterministic" else None),
-                output_mode=output_mode,
-            )
-            if isinstance(model, OpenAIClient):
-                resolved_model_id = model.model_id or resolved_model_id
-                await model.close()
-            scored = score_result(scenario, result)
-            results.append(
-                {
-                    "test_id": scenario.test_id,
-                    "trial": trial + 1,
-                    **scored,
-                    "latency_ms": result.total_execution_time_ms,
-                    "prompt_tokens": result.prompt_tokens,
-                    "completion_tokens": result.completion_tokens,
-                    "termination_reason": result.termination_reason,
-                    "model_identity": resolved_model_id,
-                }
-            )
+                client = api_client
+                api_url = str(client.base_url).rstrip("/")
+            try:
+                health = await client.get("/health", timeout=5)
+                health.raise_for_status()
+                if health.json().get("status") != "ok":
+                    raise ValueError("unexpected health response")
+            except (httpx.HTTPError, ValueError, AttributeError) as exc:
+                raise EvaluationAPIError(
+                    "La API no está disponible; inicia `make dev` y revisa API_BASE_URL."
+                ) from exc
+        for scenario in scenarios:
+            for trial in range(trials):
+                workflow = scenario.deterministic_workflow if strategy == "deterministic" else None
+                if mode == "mock":
+                    runtime_settings = Settings(
+                        **{
+                            **settings.__dict__,
+                            "max_iterations": min(
+                                settings.max_iterations, scenario.max_tool_iterations
+                            ),
+                        }
+                    )
+                    runtime = AgentRuntime(
+                        ScenarioModel(scenario, strategy, output_mode),
+                        build_registry(mock_responses=scenario.mock_tool_responses),
+                        runtime_settings,
+                    )
+                    result = await runtime.run(
+                        scenario.task,
+                        strategy=strategy,
+                        workflow=workflow,
+                        output_mode=output_mode,
+                    )
+                    api_status_code = None
+                    api_latency_ms = 0.0
+                    runtime_latency_ms: float | None = result.total_execution_time_ms
+                else:
+                    api_started = perf_counter()
+                    try:
+                        response = await client.post(
+                            "/agents/run",
+                            json={
+                                "task": scenario.task,
+                                "strategy": strategy,
+                                "workflow": workflow,
+                                "output_mode": output_mode,
+                            },
+                            timeout=httpx.Timeout(
+                                API_RUN_TIMEOUT_SECONDS, connect=5, write=5, pool=5
+                            ),
+                        )
+                    except httpx.HTTPError as exc:
+                        api_latency_ms = (perf_counter() - api_started) * 1000
+                        api_status_code = None
+                        runtime_latency_ms = None
+                        result = _api_failure_result(
+                            f"api_transport_{type(exc).__name__}", strategy, workflow, output_mode
+                        )
+                        response_fields = set()
+                    else:
+                        api_latency_ms = (perf_counter() - api_started) * 1000
+                        api_status_code = response.status_code
+                        if api_status_code in {404, 422}:
+                            raise EvaluationAPIError(
+                                f"La API rechazó el escenario {scenario.test_id} "
+                                f"(HTTP {api_status_code})."
+                            )
+                        try:
+                            payload = response.json()
+                        except ValueError:
+                            payload = None
+                        if isinstance(payload, dict) and "tool_history" in payload:
+                            try:
+                                result = AgentResult.model_validate(payload)
+                            except ValueError as exc:
+                                raise EvaluationAPIError(
+                                    "La API devolvió una respuesta inválida "
+                                    f"para {scenario.test_id}."
+                                ) from exc
+                            if result.model_id:
+                                observed_models.add(result.model_id)
+                            runtime_latency_ms = result.total_execution_time_ms
+                            response_fields = set(payload)
+                        elif api_status_code >= 500:
+                            result = _api_failure_result(
+                                f"api_http_{api_status_code}",
+                                strategy,
+                                workflow,
+                                output_mode,
+                                response.headers.get("x-request-id", "api-error"),
+                            )
+                            runtime_latency_ms = None
+                            response_fields = set()
+                        else:
+                            raise EvaluationAPIError(
+                                f"La API devolvió una respuesta inválida para {scenario.test_id}."
+                            )
+                scored = score_result(scenario, result, response_fields if mode == "live" else None)
+                results.append(
+                    {
+                        "test_id": scenario.test_id,
+                        "trial": trial + 1,
+                        **scored,
+                        "api_status_code": api_status_code,
+                        "latency_ms": api_latency_ms
+                        if mode == "live"
+                        else result.total_execution_time_ms,
+                        "runtime_latency_ms": runtime_latency_ms,
+                        "prompt_tokens": result.prompt_tokens,
+                        "completion_tokens": result.completion_tokens,
+                        "termination_reason": result.termination_reason,
+                        "model_identity": result.model_id if mode == "live" else settings.model,
+                    }
+                )
     report: dict[str, Any] = {
         "metadata": {
             "mode": mode,
             "evaluation_scope": "harness_behavior" if mode == "mock" else "live_model_behavior",
-            "tool_data_scope": "scenario_fixtures",
+            "tool_data_scope": "api_tools" if mode == "live" else "scenario_fixtures",
+            "api_base_url": api_url if mode == "live" else None,
             "strategy": strategy,
             "output_mode": output_mode,
-            "model": resolved_model_id,
+            "model": (
+                settings.model
+                if mode == "mock"
+                else next(iter(observed_models))
+                if len(observed_models) == 1
+                else "mixed"
+                if observed_models
+                else None
+            ),
             "dataset": "aiops-v1",
             "harness_version": "0.1.0",
-            "inference": {
-                "base_url": settings.llm_base_url,
-                "temperature": settings.temperature,
-                "tool_protocol": settings.tool_protocol,
-            },
-            "response_format_config": {
-                "mode": output_mode,
-                "prompt_schema": IncidentReport.model_json_schema()
-                if output_mode in {"prompt_json", "schema_json"}
-                else None,
-                "response_format": {
-                    "type": "json_object",
-                    "schema": IncidentReport.model_json_schema(),
+            "inference": (
+                {"source": "api_server", "api_base_url": api_url}
+                if mode == "live"
+                else {
+                    "base_url": settings.llm_base_url,
+                    "temperature": settings.temperature,
+                    "tool_protocol": settings.tool_protocol,
                 }
-                if output_mode == "schema_json"
-                else None,
-                "prompt_schema_included": output_mode in {"prompt_json", "schema_json"},
-                "server_acceptance_semantics": (
-                    "HTTP 2xx means request accepted; it does not prove schema enforcement."
-                ),
-            },
-            "configuration": {
-                "max_iterations": settings.max_iterations,
-                "max_tool_calls": settings.max_tool_calls,
-                "execution_timeout": settings.execution_timeout,
-                "tool_timeout": settings.tool_timeout,
-                "llm_timeout": settings.llm_timeout,
-                "max_tokens": settings.max_tokens,
-                "temperature": settings.temperature,
-                "trials": trials,
-            },
+            ),
+            "response_format_config": (
+                {"mode": output_mode, "source": "api_server", "schema": "not_introspected"}
+                if mode == "live"
+                else {
+                    "mode": output_mode,
+                    "prompt_schema": IncidentReport.model_json_schema()
+                    if output_mode in {"prompt_json", "schema_json"}
+                    else None,
+                    "response_format": {
+                        "type": "json_object",
+                        "schema": IncidentReport.model_json_schema(),
+                    }
+                    if output_mode == "schema_json"
+                    else None,
+                    "prompt_schema_included": output_mode in {"prompt_json", "schema_json"},
+                    "server_acceptance_semantics": (
+                        "HTTP 2xx means request accepted; it does not prove schema enforcement."
+                    ),
+                }
+            ),
+            "configuration": (
+                {"trials": trials}
+                if mode == "live"
+                else {
+                    "max_iterations": settings.max_iterations,
+                    "max_tool_calls": settings.max_tool_calls,
+                    "execution_timeout": settings.execution_timeout,
+                    "tool_timeout": settings.tool_timeout,
+                    "llm_timeout": settings.llm_timeout,
+                    "max_tokens": settings.max_tokens,
+                    "temperature": settings.temperature,
+                    "trials": trials,
+                }
+            ),
             "created_at": datetime.now(UTC).isoformat(),
             "trials": trials,
         },
@@ -316,6 +470,15 @@ async def evaluate(
             "mean_tool_errors": mean(row["execution_errors"] for row in results),
             "mean_latency_ms": mean(row["latency_ms"] for row in results),
             "median_latency_ms": median(row["latency_ms"] for row in results),
+            "mean_runtime_latency_ms": (
+                mean(
+                    row["runtime_latency_ms"]
+                    for row in results
+                    if row["runtime_latency_ms"] is not None
+                )
+                if any(row["runtime_latency_ms"] is not None for row in results)
+                else None
+            ),
             "mean_prompt_tokens": mean(row["prompt_tokens"] for row in results),
             "mean_completion_tokens": mean(row["completion_tokens"] for row in results),
             "by_scenario": {},
@@ -396,23 +559,34 @@ def main() -> None:
         "--output-mode", choices=["free_text", "prompt_json", "schema_json"], default="free_text"
     )
     parser.add_argument("--trials", type=int, default=1)
+    parser.add_argument("--api-url", default=None)
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--output", type=Path, default=Path("reports/latest.json"))
     args = parser.parse_args()
     if args.trials < 1:
         parser.error("--trials must be at least 1")
-    report = asyncio.run(
-        evaluate(
-            args.mode,
-            args.trials,
-            args.baseline,
-            strategy=args.strategy,
-            output_mode=args.output_mode,
-        )
+    load_dotenv(dotenv_path=".env", override=False)
+    configure_logging(
+        log_level=os.getenv("LOG_LEVEL", "INFO"),
+        log_file=os.getenv("LOG_FILE", "logs/server.jsonl") or None,
+        console=False,
     )
+    try:
+        report = asyncio.run(
+            evaluate(
+                args.mode,
+                args.trials,
+                args.baseline,
+                strategy=args.strategy,
+                output_mode=args.output_mode,
+                api_base_url=args.api_url,
+            )
+        )
+    except EvaluationAPIError as exc:
+        parser.exit(2, f"Error: {exc}\n")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
-    print(json.dumps(report["summary"], indent=2))
+    print(render_summary(report, args.output))
 
 
 if __name__ == "__main__":

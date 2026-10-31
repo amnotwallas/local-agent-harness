@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
@@ -69,6 +70,14 @@ class OpenAIClient:
             candidate = models[0].get("id") if models and isinstance(models[0], dict) else None
             self._model = candidate if isinstance(candidate, str) and candidate else None
         except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            logger.warning(
+                "Model discovery failed",
+                extra={
+                    "event": "llm.discovery_failed",
+                    "provider": "llama.cpp",
+                    "error_type": type(exc).__name__,
+                },
+            )
             raise ModelError("Could not discover a model from the inference server") from exc
         if not self._model:
             raise ModelError("The inference server returned no model identifiers")
@@ -122,7 +131,7 @@ class OpenAIClient:
                 for call in raw_calls
             ]
             usage = payload.get("usage", {})
-            return ChatResult(
+            result = ChatResult(
                 content=choice.get("content"),
                 tool_calls=tool_calls,
                 raw_tool_calls=raw_calls,
@@ -132,6 +141,39 @@ class OpenAIClient:
                 response_format_status=format_status,
                 response_format_status_code=status_code,
             )
+            logger.info(
+                "Model request completed",
+                extra={
+                    "event": "llm.completed",
+                    "provider": "llama.cpp",
+                    "model": model,
+                    "status_code": status_code,
+                    "llm_latency_ms": result.duration_ms,
+                    "input_tokens": result.prompt_tokens,
+                    "output_tokens": result.completion_tokens,
+                    "total_tokens": (
+                        result.prompt_tokens + result.completion_tokens
+                        if isinstance(result.prompt_tokens, int)
+                        and isinstance(result.completion_tokens, int)
+                        else None
+                    ),
+                    "response_format_status": format_status,
+                },
+            )
+            return result
+        except asyncio.CancelledError:
+            logger.warning(
+                "Model request cancelled",
+                extra={
+                    "event": "llm.failed",
+                    "provider": "llama.cpp",
+                    "model": model,
+                    "status": "cancelled",
+                    "llm_latency_ms": (perf_counter() - start) * 1000,
+                    "error_type": "CancelledError",
+                },
+            )
+            raise
         except (
             httpx.HTTPError,
             ValueError,
@@ -141,7 +183,18 @@ class OpenAIClient:
             AttributeError,
             ValidationError,
         ) as exc:
-            logger.warning("Model request failed (%s)", type(exc).__name__)
+            logger.warning(
+                "Model request failed",
+                extra={
+                    "event": "llm.failed",
+                    "provider": "llama.cpp",
+                    "model": model,
+                    "status_code": status_code,
+                    "llm_latency_ms": (perf_counter() - start) * 1000,
+                    "response_format_status": format_status,
+                    "error_type": type(exc).__name__,
+                },
+            )
             raise ModelError(
                 "The inference server returned an invalid or failed response",
                 response_format_status=format_status,

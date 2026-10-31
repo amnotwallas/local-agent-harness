@@ -1,4 +1,6 @@
+import asyncio
 import json
+import logging
 
 import httpx
 import pytest
@@ -49,6 +51,58 @@ async def test_client_discovers_model_and_parses_tool_calls() -> None:
     assert result.tool_calls[0].arguments == {"limit": 2}
     assert result.prompt_tokens == 8
     await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_model_call_logs_metrics_without_messages(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="agent_harness")
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "local-model"}]})
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "private response"}}],
+                "usage": {"prompt_tokens": 8, "completion_tokens": 3},
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    client = OpenAIClient(Settings(llm_base_url="http://model/v1"), http)
+    await client.chat([{"role": "user", "content": "private prompt"}])
+    await http.aclose()
+
+    event = next(r for r in caplog.records if getattr(r, "event", None) == "llm.completed")
+    assert event.__dict__["model"] == "local-model"
+    assert event.__dict__["provider"] == "llama.cpp"
+    assert event.__dict__["status_code"] == 200
+    assert event.__dict__["input_tokens"] == 8
+    assert event.__dict__["output_tokens"] == 3
+    assert event.__dict__["llm_latency_ms"] >= 0
+    assert "private prompt" not in caplog.text
+    assert "private response" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_cancelled_model_call_logs_elapsed_time(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="agent_harness")
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(1)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "late"}}]})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    client = OpenAIClient(Settings(llm_base_url="http://model/v1", model="local-model"), http)
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(client.chat([{"role": "user", "content": "private"}]), 0.01)
+    await http.aclose()
+
+    event = next(r for r in caplog.records if getattr(r, "event", None) == "llm.failed")
+    assert event.__dict__["error_type"] == "CancelledError"
+    assert event.__dict__["llm_latency_ms"] >= 0
 
 
 @pytest.mark.asyncio

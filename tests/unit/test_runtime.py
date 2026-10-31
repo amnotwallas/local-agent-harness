@@ -1,10 +1,12 @@
 import asyncio
+import logging
 from typing import Any
 
 import pytest
 
 from agent_harness.agents.runtime import AgentRuntime, ExecutionStrategy
 from agent_harness.config import Settings
+from agent_harness.logging_config import request_id_var
 from agent_harness.models.client import ChatResult, ToolCall
 from agent_harness.tools.registry import build_registry
 
@@ -43,6 +45,45 @@ async def test_runtime_executes_authorized_tool_and_returns_trace() -> None:
     assert [item.tool_name for item in result.tool_history] == ["get_service_health"]
     assert result.model_calls == 2
     assert result.termination_reason == "final_response"
+
+
+async def test_runtime_logs_tool_and_final_metrics_without_arguments(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="agent_harness")
+    result = await AgentRuntime(ScriptedModel(), build_registry(), Settings()).run(
+        "private task text", request_id="runtime-123"
+    )
+
+    tool = next(r for r in caplog.records if getattr(r, "event", None) == "tool.completed")
+    finished = next(r for r in caplog.records if getattr(r, "event", None) == "agent.finished")
+    assert tool.__dict__["request_id"] == finished.__dict__["request_id"] == result.request_id
+    assert tool.__dict__["execution_id"] == finished.__dict__["execution_id"] == result.execution_id
+    assert tool.__dict__["tool_name"] == "get_service_health"
+    assert tool.__dict__["tool_status"] == "ok"
+    assert tool.__dict__["tool_latency_ms"] >= 0
+    assert finished.__dict__["status"] == "completed"
+    assert finished.__dict__["model_calls"] == 2
+    assert finished.__dict__["tool_calls"] == 1
+    assert "private task text" not in caplog.text
+    assert "payments-api" not in caplog.text
+
+
+async def test_direct_runtime_sets_and_resets_request_context() -> None:
+    class ContextModel:
+        async def chat(
+            self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+        ) -> ChatResult:
+            assert request_id_var.get() == "direct-123"
+            return ChatResult(content="Done")
+
+    assert request_id_var.get() is None
+    result = await AgentRuntime(ContextModel(), build_registry(), Settings()).run(
+        "private task", request_id="direct-123"
+    )
+
+    assert result.status == "completed"
+    assert request_id_var.get() is None
 
 
 @pytest.mark.asyncio

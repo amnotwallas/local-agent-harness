@@ -30,9 +30,9 @@ test: ## Run deterministic tests
 	uv run --locked --offline pytest
 
 eval: ## Run live model evaluations
-	uv run --locked --offline python -m agent_harness.evals.runner --mode live --strategy $(STRATEGY) --output-mode $(OUTPUT_MODE) --trials $(TRIALS) --output $(OUTPUT)
+	@uv run --locked --offline python -m agent_harness.evals.runner --mode live --strategy $(STRATEGY) --output-mode $(OUTPUT_MODE) --trials $(TRIALS) --output $(OUTPUT)
 
 eval-mock: ## Run deterministic mocked evaluations
-	uv run --locked --offline python -m agent_harness.evals.runner --mode mock --strategy $(STRATEGY) --output-mode $(OUTPUT_MODE) --trials $(TRIALS) --output $(OUTPUT)
+	@uv run --locked --offline python -m agent_harness.evals.runner --mode mock --strategy $(STRATEGY) --output-mode $(OUTPUT_MODE) --trials $(TRIALS) --output $(OUTPUT)
 
 check: lint format-check typecheck test ## Run all offline quality checks

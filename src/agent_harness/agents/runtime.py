@@ -10,6 +10,7 @@ from pydantic import BaseModel, ValidationError
 from agent_harness.agents.incident_report import IncidentReport
 from agent_harness.agents.workflows import build_workflow_plan
 from agent_harness.config import Settings
+from agent_harness.logging_config import request_id_var
 from agent_harness.models.client import ChatResult, ModelError, ResponseFormatStatus, ToolCall
 from agent_harness.tools.registry import ToolRegistry
 
@@ -37,6 +38,7 @@ class ToolExecution(BaseModel):
 class AgentResult(BaseModel):
     request_id: str
     execution_id: str
+    model_id: str | None = None
     status: Literal[
         "completed",
         "failed",
@@ -75,10 +77,35 @@ class AgentRuntime:
         workflow: str | None = None,
         output_mode: OutputMode = "free_text",
     ) -> AgentResult:
+        bound_request_id = request_id or str(uuid4())
+        token = request_id_var.set(bound_request_id)
+        try:
+            return await self._run(task, bound_request_id, strategy, workflow, output_mode)
+        finally:
+            request_id_var.reset(token)
+
+    async def _run(
+        self,
+        task: str,
+        request_id: str,
+        strategy: ExecutionStrategy,
+        workflow: str | None,
+        output_mode: OutputMode,
+    ) -> AgentResult:
         started = perf_counter()
         deadline = started + self.settings.execution_timeout
-        request_id = request_id or str(uuid4())
         execution_id = str(uuid4())
+        logger.info(
+            "Agent run started",
+            extra={
+                "event": "agent.started",
+                "request_id": request_id,
+                "execution_id": execution_id,
+                "strategy": strategy,
+                "workflow": workflow,
+                "output_mode": output_mode,
+            },
+        )
         history: list[ToolExecution] = []
         messages: list[dict[str, Any]] = [
             {
@@ -254,12 +281,6 @@ class AgentRuntime:
                     if not isinstance(final, str) or not final.strip():
                         raise ValueError("Model returned no final response")
                     if output_mode == "free_text":
-                        logger.info(
-                            "agent completed request_id=%s execution_id=%s model_calls=%d",
-                            request_id,
-                            execution_id,
-                            model_calls,
-                        )
                         return self._result(
                             request_id,
                             execution_id,
@@ -287,12 +308,6 @@ class AgentRuntime:
                     prompt_tokens += summary.prompt_tokens or 0
                     completion_tokens += summary.completion_tokens or 0
                     model_duration_ms += summary.duration_ms
-                    logger.info(
-                        "agent completed request_id=%s execution_id=%s model_calls=%d",
-                        request_id,
-                        execution_id,
-                        model_calls,
-                    )
                     return self._result(
                         request_id,
                         execution_id,
@@ -706,6 +721,7 @@ class AgentRuntime:
         for call in calls:
             call_started = perf_counter()
             arguments_valid = False
+            error_type: str | None = None
             remaining = deadline - perf_counter()
             if remaining <= 0:
                 return [], "deadline_exceeded"
@@ -730,21 +746,28 @@ class AgentRuntime:
                     arguments_valid=arguments_valid,
                 )
             except Exception as exc:
+                error_type = type(exc).__name__
                 execution = ToolExecution(
                     tool_name=call.name,
                     arguments=call.arguments,
                     error="Tool execution failed",
                     arguments_valid=arguments_valid,
                 )
-                logger.warning(
-                    "tool failed request_id=%s execution_id=%s tool=%s error=%s",
-                    request_id,
-                    execution_id,
-                    call.name,
-                    type(exc).__name__,
-                )
             execution.duration_ms = (perf_counter() - call_started) * 1000
             history.append(execution)
+            logger.log(
+                logging.INFO if execution.error is None else logging.WARNING,
+                "Tool call finished",
+                extra={
+                    "event": "tool.completed",
+                    "request_id": request_id,
+                    "execution_id": execution_id,
+                    "tool_name": call.name if call.name in self.registry.names else "unknown",
+                    "tool_status": "ok" if execution.error is None else "error",
+                    "tool_latency_ms": execution.duration_ms,
+                    "error_type": error_type,
+                },
+            )
             tool_messages.append(
                 {
                     "role": "tool",
@@ -810,7 +833,7 @@ class AgentRuntime:
         response_format_status: ResponseFormatStatus = "not_requested",
         response_format_status_code: int | None = None,
     ) -> AgentResult:
-        return AgentResult(
+        result = AgentResult(
             request_id=request_id,
             execution_id=execution_id,
             status=status,
@@ -830,3 +853,27 @@ class AgentRuntime:
             response_format_status=response_format_status,
             response_format_status_code=response_format_status_code,
         )
+        logger.log(
+            logging.INFO if status == "completed" else logging.WARNING,
+            "Agent run finished",
+            extra={
+                "event": "agent.finished",
+                "request_id": request_id,
+                "execution_id": execution_id,
+                "status": status,
+                "termination_reason": reason,
+                "strategy": strategy,
+                "workflow": workflow,
+                "output_mode": output_mode,
+                "latency_ms": result.total_execution_time_ms,
+                "model_calls": model_calls,
+                "tool_calls": len(history),
+                "model_duration_ms": model_duration_ms,
+                "input_tokens": prompt_tokens,
+                "output_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+                "format_compliance": format_compliance,
+                "response_format_status": response_format_status,
+            },
+        )
+        return result

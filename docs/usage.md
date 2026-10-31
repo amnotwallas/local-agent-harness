@@ -19,6 +19,12 @@ Copy `.env.example` to `.env` and set `LLM_BASE_URL` to the `/v1` endpoint of yo
 
 The API binds to `127.0.0.1:8000` by default. The sample tools are in-memory fixtures and make no external monitoring or incident-system requests.
 
+## Logs
+
+`make dev` writes concise console events and structured JSON lines to `logs/server.jsonl`. Evaluation commands keep their events in that file and print one result summary after completion. The file rotates at 10 MB and keeps five backups. Set `LOG_LEVEL` (default `INFO`) or `LOG_FILE` in `.env`; an empty `LOG_FILE` disables file output. The `logs/` directory is ignored by Git.
+
+Events cover HTTP requests, agent runs, model calls, and tool calls. Each event includes available request or execution IDs, status, duration, and token counts. If OpenTelemetry supplies an active trace, its trace ID is used; otherwise the request ID is used for correlation. Prompts, answers, HTTP bodies, tool arguments, tool results, and raw exception messages are not logged. The server uses non-streaming model calls, so time to first token is not measured.
+
 ## Run an agent
 
 `POST /agents/run` accepts a task and optional tool, strategy, and output settings:

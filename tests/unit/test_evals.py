@@ -1,8 +1,13 @@
+import json
+from pathlib import Path
+
+import httpx
 import pytest
 
 from agent_harness.agents.incident_report import EvidenceStatement, IncidentReport
 from agent_harness.agents.runtime import AgentResult, ExecutionStrategy, OutputMode, ToolExecution
-from agent_harness.evals.runner import evaluate, score_result
+from agent_harness.evals.reporting import render_summary
+from agent_harness.evals.runner import EvaluationAPIError, evaluate, score_result
 from agent_harness.evals.scenarios import ExpectedCall, load_scenarios
 
 
@@ -32,6 +37,236 @@ async def test_mock_evaluation_completes_every_scenario() -> None:
     report = await evaluate(mode="mock")
     assert report["summary"]["task_successes"] == 10
     assert report["metadata"]["evaluation_scope"] == "harness_behavior"
+
+
+@pytest.mark.asyncio
+async def test_live_evaluation_sends_each_scenario_to_running_api() -> None:
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(
+            200,
+            json=AgentResult(
+                request_id="api-request",
+                execution_id="api-execution",
+                status="completed",
+                final_answer="No incident found",
+                tool_history=[],
+                total_execution_time_ms=12,
+                model_calls=1,
+            ).model_dump(mode="json"),
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://api.test"
+    ) as client:
+        report = await evaluate(mode="live", api_client=client)
+
+    assert requests[0].url.path == "/health"
+    assert requests[0].extensions["timeout"]["read"] == 5
+    posts = requests[1:]
+    assert len(posts) == len(load_scenarios())
+    assert all(request.url.path == "/agents/run" for request in posts)
+    assert posts[0].extensions["timeout"]["read"] == 3610
+    assert posts[0].extensions["timeout"]["connect"] == 5
+    assert posts[0].extensions["timeout"]["write"] == 5
+    assert json.loads(posts[0].content)["task"] == load_scenarios()[0].task
+    assert json.loads(posts[0].content)["strategy"] == "autonomous"
+    assert report["metadata"]["tool_data_scope"] == "api_tools"
+    assert report["metadata"]["inference"] == {
+        "source": "api_server",
+        "api_base_url": "http://api.test",
+    }
+    assert report["metadata"]["configuration"] == {"trials": 1}
+    assert report["metadata"]["response_format_config"] == {
+        "mode": "free_text",
+        "source": "api_server",
+        "schema": "not_introspected",
+    }
+    assert len(report["results"]) == len(load_scenarios())
+    assert report["results"][0]["runtime_latency_ms"] == 12
+    assert report["results"][0]["latency_ms"] > 0
+    assert report["summary"]["mean_runtime_latency_ms"] == 12
+    report["metadata"]["model"] = "/private/models/local-model.gguf"
+    assert "Modelo: local-model.gguf" in render_summary(report, Path("reports/latest.json"))
+    assert "Ejecución media del servidor" in render_summary(report, Path("reports/latest.json"))
+    assert "causas: selección de herramientas" in render_summary(
+        report, Path("reports/latest.json")
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminal_summary_is_readable_and_keeps_per_scenario_results() -> None:
+    report = await evaluate(mode="mock")
+
+    summary = render_summary(report, Path("reports/latest.json"))
+
+    assert "10/10" in summary
+    assert "Escenario" in summary
+    assert "healthy-service" in summary
+    assert "Cobertura" in summary
+    assert "Latencia" in summary
+    assert "No solicitado: 10" in summary
+    assert "reports/latest.json" in summary
+    assert '"by_scenario"' not in summary
+
+
+@pytest.mark.asyncio
+async def test_live_evaluation_records_model_http_failures_in_report() -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(502, headers={"x-request-id": "api-123"}, json={"error": "failed"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://api.test"
+    ) as client:
+        report = await evaluate(mode="live", api_client=client)
+
+    assert report["summary"]["infrastructure_errors"] == 10
+    assert report["results"][0]["termination_reason"] == "api_http_502"
+    assert report["results"][0]["api_status_code"] == 502
+    assert report["results"][0]["latency_ms"] > 0
+    assert "causas: API HTTP 502" in render_summary(report, Path("reports/latest.json"))
+
+
+@pytest.mark.asyncio
+async def test_live_evaluation_records_non_json_server_errors() -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(500, text="upstream error page")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://api.test"
+    ) as client:
+        report = await evaluate(mode="live", api_client=client)
+
+    assert report["summary"]["infrastructure_errors"] == 10
+    assert report["results"][0]["termination_reason"] == "api_http_500"
+
+
+@pytest.mark.asyncio
+async def test_live_evaluation_checks_fields_present_in_raw_api_response() -> None:
+    result = AgentResult(
+        request_id="r",
+        execution_id="e",
+        status="completed",
+        final_answer="Done",
+        tool_history=[],
+        total_execution_time_ms=1,
+        model_calls=1,
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(200, json=result.model_dump(exclude={"model_duration_ms"}))
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://api.test"
+    ) as client:
+        report = await evaluate(mode="live", api_client=client)
+
+    assert report["results"][0]["output_schema"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_live_report_keeps_each_trial_model_and_marks_mixed_runs() -> None:
+    calls = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        calls += 1
+        if calls > 2:
+            return httpx.Response(502, json={"error": "failed"})
+        return httpx.Response(
+            200,
+            json=AgentResult(
+                request_id="r",
+                execution_id="e",
+                model_id="model-A" if calls == 1 else "model-B",
+                status="completed",
+                final_answer="Done",
+                tool_history=[],
+                total_execution_time_ms=1,
+                model_calls=1,
+            ).model_dump(mode="json"),
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://api.test"
+    ) as client:
+        report = await evaluate(mode="live", api_client=client)
+
+    assert report["results"][0]["model_identity"] == "model-A"
+    assert report["results"][1]["model_identity"] == "model-B"
+    assert report["results"][2]["model_identity"] is None
+    assert report["metadata"]["model"] == "mixed"
+
+
+@pytest.mark.asyncio
+async def test_live_evaluation_keeps_report_when_api_drops_after_health() -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://api.test"
+    ) as client:
+        report = await evaluate(mode="live", api_client=client)
+
+    assert report["summary"]["infrastructure_errors"] == 10
+    assert report["results"][0]["termination_reason"] == "api_transport_ReadTimeout"
+    assert "causas: conexión API ReadTimeout" in render_summary(report, Path("reports/latest.json"))
+
+
+@pytest.mark.asyncio
+async def test_live_evaluation_ignores_invalid_local_model_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LLM_MAX_TOKENS", "invalid")
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(
+            200,
+            json=AgentResult(
+                request_id="r",
+                execution_id="e",
+                status="completed",
+                final_answer="Done",
+                tool_history=[],
+                total_execution_time_ms=1,
+                model_calls=1,
+            ).model_dump(mode="json"),
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://api.test"
+    ) as client:
+        report = await evaluate(mode="live", api_client=client)
+
+    assert report["summary"]["scenarios"] == 10
+
+
+@pytest.mark.asyncio
+async def test_live_evaluation_requires_available_api() -> None:
+    def unavailable(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(unavailable), base_url="http://api.test"
+    ) as client:
+        with pytest.raises(EvaluationAPIError, match="make dev"):
+            await evaluate(mode="live", api_client=client)
 
 
 @pytest.mark.asyncio

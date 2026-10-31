@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from typing import Any
 
 import pytest
@@ -17,6 +18,21 @@ class FinalModel:
 
 
 @pytest.mark.asyncio
+async def test_api_exposes_resolved_model_id_for_evaluation() -> None:
+    class NamedModel(FinalModel):
+        model_id = "local-model"
+
+    async with AsyncClient(
+        transport=ASGITransport(app=create_app(settings=Settings(), model=NamedModel())),
+        base_url="http://test",
+    ) as client:
+        response = await client.post("/agents/run", json={"task": "Check status"})
+
+    assert response.status_code == 200
+    assert response.json()["model_id"] == "local-model"
+
+
+@pytest.mark.asyncio
 async def test_health_tools_and_agent_run_contracts() -> None:
     async with AsyncClient(
         transport=ASGITransport(app=create_app(settings=Settings(), model=FinalModel())),
@@ -31,6 +47,90 @@ async def test_health_tools_and_agent_run_contracts() -> None:
     assert response.json()["request_id"]
     assert response.json()["execution_id"]
     assert response.json()["final_answer"] == "No active incident is indicated."
+
+
+@pytest.mark.asyncio
+async def test_request_log_correlates_agent_run_without_logging_task(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="agent_harness")
+    async with AsyncClient(
+        transport=ASGITransport(app=create_app(settings=Settings(), model=FinalModel())),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/agents/run",
+            headers={"x-request-id": "test-request-123"},
+            json={"task": "private task text"},
+        )
+
+    events = [r for r in caplog.records if getattr(r, "event", None) == "http.request"]
+    assert len(events) == 1
+    assert events[0].__dict__["request_id"] == response.json()["request_id"] == "test-request-123"
+    assert events[0].__dict__["method"] == "POST"
+    assert events[0].__dict__["path"] == "/agents/run"
+    assert events[0].__dict__["status_code"] == 200
+    assert events[0].__dict__["latency_ms"] >= 0
+    assert response.headers["x-request-id"] == "test-request-123"
+    assert "private task text" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_unexpected_error_keeps_request_id_and_redacts_exception(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class BrokenModel:
+        async def chat(
+            self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+        ) -> ChatResult:
+            raise RuntimeError("private server detail")
+
+    caplog.set_level(logging.INFO, logger="agent_harness")
+    async with AsyncClient(
+        transport=ASGITransport(
+            app=create_app(settings=Settings(), model=BrokenModel()), raise_app_exceptions=False
+        ),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/agents/run", headers={"x-request-id": "error-123"}, json={"task": "check"}
+        )
+
+    assert response.status_code == 500
+    assert response.json()["request_id"] == "error-123"
+    assert response.headers["x-request-id"] == "error-123"
+    assert any(getattr(r, "event", None) == "http.error" for r in caplog.records)
+    assert "private server detail" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_untrusted_request_id_is_replaced_for_validation_errors() -> None:
+    async with AsyncClient(
+        transport=ASGITransport(app=create_app(settings=Settings(), model=FinalModel())),
+        base_url="http://test",
+    ) as client:
+        response = await client.post("/agents/run", headers={"x-request-id": "../bad"}, json={})
+
+    assert response.status_code == 422
+    assert response.json()["request_id"] != "../bad"
+    assert response.headers["x-request-id"] == response.json()["request_id"]
+
+
+@pytest.mark.asyncio
+async def test_unmatched_url_is_not_persisted_in_request_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="agent_harness")
+    async with AsyncClient(
+        transport=ASGITransport(app=create_app(settings=Settings(), model=FinalModel())),
+        base_url="http://test",
+    ) as client:
+        response = await client.get("/private-token-123")
+
+    event = next(r for r in caplog.records if getattr(r, "event", None) == "http.request")
+    assert response.status_code == 404
+    assert event.__dict__["path"] == "<unmatched>"
+    assert "private-token-123" not in caplog.text
 
 
 @pytest.mark.asyncio
